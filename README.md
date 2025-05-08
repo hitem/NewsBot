@@ -67,26 +67,40 @@ This guide walks you through installing, configuring, and running your NewsBot�
 
    ```json
    [
-     {
-       "name": "Ransomware.Live (SE)",
-       "url": "https://api.ransomware.live/v2/countryvictims/SE",
-       "poll_interval_minutes": 10,
-       "channel_id": 123456789012345678, <--- SET YOUR FIRST CHANNEL ID
-       "embed_color": 16737840, <--- CHOSE A FISRT COLOR
-       "embed": {
-         "title":      "{post_title}",
-         "url":        "{post_url}",
-         "description":"{description}",
-         "timestamp":  "{published}",
-         "fields": [
-           { "name": "Group",   "value": "{group_name}", "inline": true },
-           { "name": "Website", "value": "{website}",    "inline": true }
-         ],
-         "auto_fields": false,
-         "footer_text": "Published"
-       }
+   {
+     "name": "Ransomware victims (SE)",
+     "url": "https://api.ransomware.live/v2/countryvictims/SE",
+     "poll_interval_minutes": 10,
+     "channel_id": 123456789012345678,    // ← SET YOUR CHANNEL ID
+     "embed_color": 16711680,             // 0xFF0000 <- SET YOUR COLOR
+     "embed": {
+       "title":       "{post_title}",
+       "url":         "{post_url}",
+       "description": "{description}",
+       "timestamp":   "{published}",
+       "fields": [
+         {
+           "name":   "⚔️ Group",
+           "value":  "{group_name}",
+           "inline": true
+         },
+         {
+           "name":   "🌐 Website",
+           "value":  "{website}",
+           "inline": true
+         },
+         {
+           "name":   "🕵️ Discovered",
+           "value":  "{discovered}",
+           "inline": true
+         }
+       ],
+       "auto_fields": false,
+       "footer_text": "{published}"
      }
+   }
    ]
+
    ```
    Its good practice to make your own style to make the card posted to teams look better ofc. Else the bot will use a dynamic one that just adds "all fields" (which for some newsfeeds can look bulky).
    If you have an API you want to post from, copy the JSON and ask chatgipity for a clean looking version of that feed to add to your state.json (and show that structure).
