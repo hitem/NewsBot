@@ -63,7 +63,7 @@ This guide walks you through installing, configuring, and running your NewsBotâ€
    - Navigate to the channel where you want posts, rightâ€‘click its name in the channel list, and select **Copy ID**.  
    - Paste that numeric ID when configuring `feeds.json`.
 
-4. **Seed `feeds.json`** with at least one feed. Example:
+4. **Seed `feeds.json`** with at least one feed (only 1 first feed is needed, else will be added dynamicly). Example:
 
    ```json
    [
@@ -71,7 +71,8 @@ This guide walks you through installing, configuring, and running your NewsBotâ€
        "name": "Ransomware.Live (SE)",
        "url": "https://api.ransomware.live/v2/countryvictims/SE",
        "poll_interval_minutes": 10,
-       "channel_id": 123456789012345678, <--- SET YOUR CHANNEL ID
+       "channel_id": 123456789012345678, <--- SET YOUR FIRST CHANNEL ID
+       "embed_color": 16737840, <--- CHOSE A FISRT COLOR
        "embed": {
          "title":      "{post_title}",
          "url":        "{post_url}",
@@ -87,6 +88,8 @@ This guide walks you through installing, configuring, and running your NewsBotâ€
      }
    ]
    ```
+   Its good practice to make your own style to make the card posted to teams look better ofc. Else the bot will use a dynamic one that just adds "all fields" (which for some newsfeeds can look bulky).
+   If you have an API you want to post from, copy the JSON and ask chatgipity for a clean looking version of that feed to add to your state.json (and show that structure).
 
 5. **Initialize `state.json`** as an empty JSON object:
 
