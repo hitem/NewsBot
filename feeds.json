@@ -1,0 +1,35 @@
+[
+    ##### REMOVE ME : These two are just templates to show ######
+    {
+      "name": "Ransomware Victims (SE)",
+      "url": "https://api.ransomware.live/v2/countryvictims/SE",
+      "poll_interval_minutes": 60,
+      "channel_id": 0,          // ← set your channel ID
+      "embed_color": 16729344,  // ← decimal color, e.g. 0xFF6633 → 16729344
+      "embed": {
+        "title": "{title}",
+        "url": "{url}",
+        "description": "{description}",
+        "timestamp": "{timestamp}",
+        "fields": [],
+        "auto_fields": true,
+        "footer_text": "Published"
+      }
+    },
+    {
+      "name": "Ransomware Cyberattacks (SE)",
+      "url": "https://api.ransomware.live/v2/countrycyberattacks/SE",
+      "poll_interval_minutes": 60,
+      "channel_id": 0,          // ← set your channel ID
+      "embed_color": 65280,     // ← decimal color, e.g. 0x00FF00 → 65280
+      "embed": {
+        "title": "{title}",
+        "url": "{url}",
+        "description": "{description}",
+        "timestamp": "{timestamp}",
+        "fields": [],
+        "auto_fields": true,
+        "footer_text": "Published"
+      }
+    }
+  ]

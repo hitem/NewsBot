@@ -1,0 +1,22 @@
+# ─── Python virtualenv ─────────────────────────────────────────────────────────
+venv/
+
+# ─── Local secrets ──────────────────────────────────────────────────────────────
+.env
+
+# ─── Bot runtime state & caches ─────────────────────────────────────────────────
+state.json
+*atomic*
+
+# ─── Python bytecode & IDE cruft ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.swp
+
+# ─── Ignore .txt and .jpg assets by default, but keep requirements.txt ─────────
+*.txt
+*.jpg
+!requirements.txt
+
+# ─── (optionally) lockfiles if you don't want to commit them ───────────────────
+# Pipfile.lock           # uncomment if you want to ignore Pipfile.lock too
