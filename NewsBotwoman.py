@@ -6,6 +6,7 @@ import pytz
 import aiohttp
 from datetime import datetime
 import html
+import logging
 import re
 import logging
 import asyncio
@@ -17,8 +18,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
+
+#─ Suppress Discord.py logs ────────────────────────────────────────────────────
+for lib in ('discord', 'discord.client', 'discord.gateway', 'discord.http'):
+    lib_logger = logging.getLogger(lib)
+    lib_logger.handlers.clear()
+    lib_logger.propagate = True
+    lib_logger.setLevel(logging.INFO)
 
 # ── Config & State ────────────────────────────────────────────────────────────
 FEEDS_FILE      = 'feeds.json'
