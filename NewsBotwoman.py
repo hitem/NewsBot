@@ -113,6 +113,18 @@ def has_moderator_role(ctx):
     return any(r.name in MODERATOR_ROLES for r in ctx.author.roles)
 
 @bot.event
+async def on_disconnect():
+    logger.warning("Lost connection to Discord…")
+
+@bot.event
+async def on_resumed():
+    logger.info("Reconnected to Discord (session resumed)")
+
+@bot.event
+async def on_connect():
+    logger.info("Connected to Discord gateway")
+
+@bot.event
 async def on_ready():
     logger.info("#############################################################")
     logger.info("#   Created by hitem      #github.com/hitem       NewsBot   #")
