@@ -366,9 +366,9 @@ async def news_add_feed(ctx, *args):
     if any(f['url'] == url and f['channel_id'] == ctx.channel.id for f in feeds):
         return await ctx.send("⚠️ Feed already exists in this channel.")
 
-
-    if url in state:
-        state.pop(url)
+    composite = f"{url}::{ctx.channel.id}"
+    if composite in state:
+        state.pop(composite)
         save_json(STATE_FILE, state)
 
     if "countryvictims" in url:
@@ -392,6 +392,7 @@ async def news_add_feed(ctx, *args):
     feeds.append(feed)
     save_json(FEEDS_FILE, feeds)
     start_feed_task(feed)
+    await fetch_and_post(feed)
     await ctx.send(f"✅ Added **{name}** every {interval} min with color `#{tpl['embed_color']:06X}`.")
 
 @bot.command(name='newsremovefeed')
@@ -409,9 +410,12 @@ async def news_remove_feed(ctx, index: int):
     stop_feed_task(feed)
     feeds.remove(feed)
     save_json(FEEDS_FILE, feeds)
-    if feed['url'] in state:
-        state.pop(feed['url'])
+
+    composite = f"{feed['url']}::{feed['channel_id']}"
+    if composite in state:
+        state.pop(composite)
         save_json(STATE_FILE, state)
+
     await ctx.send(f"🗑️ Removed **{feed['name']}** (#{index}).")
 
 @bot.command(name='newslistfeeds')
