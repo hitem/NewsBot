@@ -4,7 +4,7 @@ import logging
 import re
 import html
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytz
 import aiohttp
@@ -31,6 +31,7 @@ STATE_FILE      = 'state.json'
 MODERATOR_ROLES = {"Admins", "Super Friends"}
 CET = pytz.timezone('Europe/Stockholm')
 HELP_COOLDOWN_SECONDS = 5
+next_poll_times = {}  # key: (url, chan_id), value: datetime of next poll
 
 # ── Ransomware.Live embed‐templates ──────────────────────────────────────────
 RANSOMWARE_TEMPLATES = {
@@ -130,15 +131,20 @@ def start_feed_task(feed):
     if key in feed_tasks:
         return
 
-    @tasks.loop(minutes=feed.get('poll_interval_minutes', 5))
+    interval = feed.get('poll_interval_minutes', 5)
+    @tasks.loop(minutes=interval)
     async def poll_feed():
         try:
             await fetch_and_post(feed)
         except Exception as e:
             logger.error(f"[{feed.get('name')}] Error: {e}")
+        # After finishing, set next poll time
+        next_poll_times[key] = datetime.now(CET) + timedelta(minutes=interval)
 
+    # Set first poll time (delayed start)
+    next_poll_times[key] = datetime.now(CET) + timedelta(minutes=interval)
     feed_tasks[key] = poll_feed
-    bot.loop.call_later(feed.get('poll_interval_minutes', 5)*60, poll_feed.start)
+    bot.loop.call_later(interval*60, poll_feed.start)
 
 def stop_feed_task(feed):
     key = (feed['url'], feed['channel_id'])
@@ -184,20 +190,31 @@ async def fetch_and_post(feed):
     # 3) Load/migrate state
     raw_s = state.get(state_key)
     if isinstance(raw_s, dict):
-        last_pub  = datetime.fromisoformat(raw_s.get('last_seen_pub'))
-        last_disc = datetime.fromisoformat(raw_s.get('last_seen_disc'))
+        last_pub  = raw_s.get('last_seen_pub', '')
+        titles_at_last = set(raw_s.get('titles_seen_at_last_pub', []))
     else:
-        try:
-            last_pub = datetime.fromisoformat(raw_s)
-        except:
-            last_pub = datetime.min
-        last_disc = datetime.min
+        last_pub = raw_s if isinstance(raw_s, str) else ''
+        titles_at_last = set()
 
     # 4) Collect new
     to_post = []
     for dt_pub, dt_disc, item in parsed:
-        if (dt_pub, dt_disc) > (last_pub, last_disc):
+        pubstr = dt_pub.isoformat()
+        title = item.get('post_title') or item.get('title') or None
+        if not title:
+            # fallback: use pubdate as unique, only post first item for each date
+            title = f"__fallback__{dt_pub.isoformat()}"
+        if pubstr > last_pub:
+            # Newer date, always post, reset titles_at_last
             to_post.append((dt_pub, dt_disc, item))
+        elif pubstr == last_pub:
+            if title not in titles_at_last:
+                # Same pubdate, but unseen title
+                to_post.append((dt_pub, dt_disc, item))
+        else:
+            # Older, skip
+            continue
+
     if not to_post:
         return
 
@@ -207,17 +224,33 @@ async def fetch_and_post(feed):
         logger.error(f"[{name}] Channel {chan_id} not found")
         return
 
-    for dt_pub, dt_disc, item in reversed(to_post):
+    # To keep state accurate, process in time order
+    to_post = sorted(to_post, key=lambda x: (x[0], x[2].get('post_title','')))
+    for dt_pub, dt_disc, item in to_post:
+        # 1) Resolve the title exactly once, including fallback
+        pubstr = dt_pub.isoformat()
+        resolved_title = item.get('post_title') or item.get('title')
+        if not resolved_title:
+            # fallback: use pubdate as unique
+            resolved_title = f"__fallback__{pubstr}"
+
+        # 2) Send the embed
         embed = build_dynamic_embed(feed, item)
         await channel.send(embed=embed)
 
-        last_pub, last_disc = dt_pub, dt_disc
+        # 3) Update state using that same resolved_title
+        if pubstr > last_pub:
+            last_pub = pubstr
+            titles_at_last = {resolved_title}
+        else:  # pubstr == last_pub
+            titles_at_last.add(resolved_title)
+
         state[state_key] = {
-            'last_seen_pub':  last_pub.isoformat(),
-            'last_seen_disc': last_disc.isoformat()
+            'last_seen_pub': last_pub,
+            'titles_seen_at_last_pub': list(titles_at_last)
         }
         save_json(STATE_FILE, state)
-        logger.info(f"[{name}] Posted up to {state[state_key]} in channel {chan_id}")
+        logger.info(f"[{name}] Posted: {resolved_title} at {pubstr} in channel {chan_id}")
         await asyncio.sleep(1)
 
 # ── Embed Builder ─────────────────────────────────────────────────────────────
@@ -335,6 +368,7 @@ async def news_add_feed(ctx, *args):
     start_feed_task(feed)
     await fetch_and_post(feed)
     await ctx.send(f"✅ Added **{name}** every {interval} min with color `#{tpl['embed_color']:06X}`.")
+    logger.info(f"{ctx.author} used newsaddfeed command in {ctx.channel}")
 
 @bot.command(name='newsremovefeed')
 @commands.cooldown(1,10,commands.BucketType.user)
@@ -350,6 +384,7 @@ async def news_remove_feed(ctx, index: int):
     if comp in state:
         state.pop(comp); save_json(STATE_FILE, state)
     await ctx.send(f"🗑️ Removed **{feed['name']}** (#{index}).")
+    logger.info(f"{ctx.author} used newsremovefeed command in {ctx.channel}")
 
 @bot.command(name='newslistfeeds')
 async def news_list_feeds(ctx):
@@ -362,6 +397,7 @@ async def news_list_feeds(ctx):
         mention = ch.mention if ch else f"`{f['channel_id']}`"
         lines.append(f"{i}. **{f['name']}** → {mention} every {f['poll_interval_minutes']} min\n<{f['url']}>")
     await ctx.send("**Configured feeds:**\n"+"\n".join(lines))
+    logger.info(f"{ctx.author} used newslistfeeds command in {ctx.channel}")
 
 async def attach_embed_info(ctx, embed: discord.Embed) -> discord.Embed:
     if ctx.guild and ctx.guild.icon:
@@ -382,11 +418,12 @@ async def news_settings(ctx):
         "- `!newslistfeeds` — List feeds.\n"
         "- `!newstest <#>` — Show latest entry.\n"
         "- `!newssettings` — Show this help card.\n"
+        "- `!newstimer <#>` — Show time until next poll for a feed.\n"
     )
     embed = discord.Embed(title="NewsBot Help", description=help_text, colour=0x1ABC9C)
     embed = await attach_embed_info(ctx, embed)
     await ctx.send(embed=embed)
-    logger.info(f"{ctx.author} used newssettings command")
+    logger.info(f"{ctx.author} used newssettings command in {ctx.channel}")
 
 @bot.command(name='newstest')
 async def news_test(ctx, index: int):
@@ -407,6 +444,26 @@ async def news_test(ctx, index: int):
         return await ctx.send("No items found.")
     items.sort(key=lambda i: (i.get('published') or ''), reverse=True)
     await ctx.send(embed=build_dynamic_embed(feed, items[0]))
+    logger.info(f"{ctx.author} used newstest command in {ctx.channel}")
+
+@bot.command(name='newstimer')
+async def news_timer(ctx, index: int):
+    guild_feeds = [f for f in feeds if (bot.get_channel(f['channel_id']) or discord.Object(id=0)).guild == ctx.guild]
+    if not guild_feeds:
+        return await ctx.send("No feeds here.")
+    if index < 1 or index > len(guild_feeds):
+        return await ctx.send("⚠️ Invalid feed #.")
+    feed = guild_feeds[index-1]
+    key = (feed['url'], feed['channel_id'])
+    next_time = next_poll_times.get(key)
+    if next_time:
+        now = datetime.now(CET)
+        delta = next_time - now
+        minutes, seconds = divmod(int(delta.total_seconds()), 60)
+        await ctx.send(f"⏳ Next poll for **{feed['name']}** in {minutes}m {seconds}s")
+    else:
+        await ctx.send(f"Timer not started or no info for **{feed['name']}**.")
+    logger.info(f"{ctx.author} used newstimer command in {ctx.channel}")
 
 if __name__ == '__main__':
     bot.run(TOKEN)

@@ -181,6 +181,7 @@ Use the following Discord commands (moderators only) to manage feeds without edi
 - `!newslistfeeds`                      — List all configured feeds and their target channels  
 - `!newssettings`                       — Show the NewsBot settings & commands help card  
 - `!newstest <feed number>`             — Fetch and display the very latest entry from the specified feed  
+- `!newstimer <feed number>`            — Show time until next poll for a feed  
 
 ---
 
