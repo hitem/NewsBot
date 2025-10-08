@@ -27,6 +27,7 @@ logging.getLogger("discord.gateway").setLevel(logging.WARNING)
 logging.getLogger("discord.client").setLevel(logging.WARNING)
 logging.getLogger("discord.http").setLevel(logging.WARNING)
 logging.getLogger("discord.ext.commands").setLevel(logging.ERROR)
+# but logg this bad boi
 logger.info(
     f"RWL_API_KEY loaded: {'yes' if RWL_API_KEY else 'no'} ({len(RWL_API_KEY) if RWL_API_KEY else 0} chars)")
 
@@ -37,6 +38,7 @@ MODERATOR_ROLES = {"Admins", "Super Friends"}
 CET = pytz.timezone('Europe/Stockholm')
 HELP_COOLDOWN_SECONDS = 5
 next_poll_times = {}  # key: (provider, url, chan_id) -> next poll datetime
+MAX_POSTS_PER_POLL = 10 # cap incase bananas api
 
 # ── Ransomware.Live embed‐templates ──────────────────────────────────────────
 RANSOMWARE_TEMPLATES = {
@@ -243,12 +245,19 @@ async def fetch_and_post(feed):
             newest_disc = victims[0].get("discovered", "")
             if not last_disc:
                 newest_dt = parse_any_iso(newest_disc)
+
+                # capture all IDs that share the newest discovered timestamp
+                ids_at_watermark = [
+                    v.get("id") for v in victims
+                    if parse_any_iso(v.get("discovered","")) == newest_dt and v.get("id")
+                ]
+
                 state[state_key] = {
                     "last_seen_disc": iso_utc(newest_dt),
-                    "ids_seen_at_last_disc": []
+                    "ids_seen_at_last_disc": ids_at_watermark 
                 }
                 save_json(STATE_FILE, state)
-                logger.info(f"[{name}] Seeded watermark {iso_utc(newest_dt)} (no posts).")
+                logger.info(f"[{name}] Seeded watermark {iso_utc(newest_dt)} with {len(ids_at_watermark)} id(s).")
                 return
 
             # 4) Collect new items
@@ -267,8 +276,13 @@ async def fetch_and_post(feed):
 
             # 5) Post oldest→newest for stable order
             to_post.sort(key=lambda i: (parse_any_iso(i["discovered"]), i["post_title"]))
+
+            # hard cap per poll — take the oldest N 
+            if len(to_post) > MAX_POSTS_PER_POLL:
+                logger.info(f"[{name}] Capping {len(to_post)} new items to {MAX_POSTS_PER_POLL} this poll.")
+            to_post = to_post[:MAX_POSTS_PER_POLL]
+
             for item in to_post:
-                # build + send embed
                 embed = build_dynamic_embed(feed, item)
                 await channel.send(embed=embed)
                 logger.info(f"[{name}] Posted: {item['post_title']} (disc {item['discovered']})")
@@ -321,7 +335,7 @@ async def fetch_and_post(feed):
             disc_dt = parse_any_iso(it.get('discovered', ""))
 
             # Skip obviously bogus dates (prevents 0001-01-01Z spam)
-            if pub_dt.year < 1900:
+            if pub_dt.year < 1999:
                 continue
             
             parsed.append((pub_dt, disc_dt, it))
@@ -370,8 +384,14 @@ async def fetch_and_post(feed):
 
         # 5) Post oldest→newest for stable order, update state
         to_post.sort(key=lambda x: (x[0], x[2]))
+
+        # hard cap per poll — take the oldest N
+        if len(to_post) > MAX_POSTS_PER_POLL:
+            logger.info(f"[{name}] Capping {len(to_post)} new items to {MAX_POSTS_PER_POLL} this poll.")
+        to_post = to_post[:MAX_POSTS_PER_POLL]
+
+
         for pub_dt, it, resolved_title in to_post:
-            # send
             embed = build_dynamic_embed(feed, it)
             await channel.send(embed=embed)
             if pub_dt > last_pub_dt:
