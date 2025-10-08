@@ -11,10 +11,13 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+from urllib.parse import urlencode
 
 # ── Load env ─────────────────────────────────────────────────────────────────
 load_dotenv()
 TOKEN = os.environ['DISCORD_BOT_TOKEN']
+RWL_API_KEY = os.getenv("RWL_API_KEY")
+RWL_COUNTRY = os.getenv("RWL_COUNTRY", "SE")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s]: %(message)s')
@@ -24,6 +27,7 @@ logging.getLogger("discord.gateway").setLevel(logging.WARNING)
 logging.getLogger("discord.client").setLevel(logging.WARNING)
 logging.getLogger("discord.http").setLevel(logging.WARNING)
 logging.getLogger("discord.ext.commands").setLevel(logging.ERROR)
+logger.info(f"RWL_API_KEY loaded: {'yes' if RWL_API_KEY else 'no'} ({len(RWL_API_KEY) if RWL_API_KEY else 0} chars)")
 
 # ── Config & State ───────────────────────────────────────────────────────────
 FEEDS_FILE      = 'feeds.json'
@@ -39,16 +43,16 @@ RANSOMWARE_TEMPLATES = {
         "embed_color": 0xFF0000,
         "embed": {
             "title":       "{post_title}",
-            "url":         "{post_url}",
+            "url":         "{permalink}",
             "description": "{description}",
-            "timestamp":   "{published}",
+            "timestamp":   "{discovered}",
             "fields": [
                 {"name":   "⚔️ Group",    "value":  "{group_name}", "inline": True},
                 {"name":   "🌐 Website",  "value":  "{website}",    "inline": True},
                 {"name":   "🕵️ Discovered","value":  "{discovered}",  "inline": True}
             ],
             "auto_fields": False,
-            "footer_text": "{published}"
+            "footer_text": "{discovered}"
         }
     },
     "cyberattacks": {
@@ -83,6 +87,33 @@ def save_json(path, data):
 
 def has_moderator_role(ctx):
     return any(r.name in MODERATOR_ROLES for r in ctx.author.roles)
+
+def iso_utc(dt: datetime) -> str:
+    # Always return ISO with 'Z'
+    return dt.astimezone(pytz.UTC).replace(tzinfo=None).isoformat(timespec="seconds") + "Z"
+
+def parse_any_iso(s: str) -> datetime:
+    # Accept "YYYY-MM-DD HH:MM:SS.ssssss" or "YYYY-MM-DDTHH:MM:SSZ"
+    if not s:
+        return datetime.min.replace(tzinfo=pytz.UTC)
+    s = s.strip().replace(" ", "T")
+    if s.endswith("Z"):
+        try:
+            return datetime.fromisoformat(s[:-1]).replace(tzinfo=pytz.UTC)
+        except Exception:
+            pass
+    try:
+        # If no tz, assume UTC
+        dt = datetime.fromisoformat(s)
+        return dt.replace(tzinfo=pytz.UTC) if dt.tzinfo is None else dt.astimezone(pytz.UTC)
+    except Exception:
+        return datetime.min.replace(tzinfo=pytz.UTC)
+
+def strip_html_to_text(s: str) -> str:
+    if not s: return ""
+    s = re.sub(r'(?i)<br\s*/?>', '\n', s)
+    s = re.sub(r'<[^>]+>', '', s)
+    return html.unescape(s).strip()
 
 # ── State ─────────────────────────────────────────────────────────────────────
 feeds      = load_json(FEEDS_FILE, [])
@@ -124,7 +155,6 @@ async def on_connect():
     logger.info("Connected to Discord gateway")
 
 # ── Feed Task Management ─────────────────────────────────────────────────────
-
 def start_feed_task(feed):
     url, chan_id = feed['url'], feed['channel_id']
     key = (url, chan_id)
@@ -154,104 +184,178 @@ def stop_feed_task(feed):
 
 # ── Core: Fetch, Detect New, Post ─────────────────────────────────────────────
 async def fetch_and_post(feed):
+    logger.info(f"[{name}] provider={feed.get('provider')} url={url}")
     url, name, chan_id = feed['url'], feed.get('name', feed['url']), feed['channel_id']
-    state_key = f"{url}::{chan_id}"
+    provider = feed.get("provider", "generic_json")
+    state_key = f"{provider}:{url}::{chan_id}"
 
-    # 1) Fetch JSON
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers={'Accept': 'application/json'}) as resp:
-            if resp.status != 200:
-                logger.error(f"[{name}] HTTP {resp.status}")
-                return
-            data = await resp.json()
-
-    # 2) Build (pub, disc, item)
-    tpl           = feed.get('embed', {})
-    timestamp_tpl = tpl.get('timestamp', '{timestamp}')
-    raw           = data if isinstance(data, list) else data.get('items', [])
-    parsed = []
-    for item in raw:
-        # published
-        try:
-            dt_pub = datetime.fromisoformat(timestamp_tpl.format_map(item))
-        except:
-            dt_pub = datetime.min
-        # discovered
-        try:
-            dt_disc = datetime.fromisoformat(item.get('discovered', ''))
-        except:
-            dt_disc = datetime.min
-        parsed.append((dt_pub, dt_disc, item))
-
-    parsed.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    if not parsed:
-        return
-
-    # 3) Load/migrate state
-    raw_s = state.get(state_key)
-    if isinstance(raw_s, dict):
-        last_pub  = raw_s.get('last_seen_pub', '')
-        titles_at_last = set(raw_s.get('titles_seen_at_last_pub', []))
-    else:
-        last_pub = raw_s if isinstance(raw_s, str) else ''
-        titles_at_last = set()
-
-    # 4) Collect new
-    to_post = []
-    for dt_pub, dt_disc, item in parsed:
-        pubstr = dt_pub.isoformat()
-        title = item.get('post_title') or item.get('title') or None
-        if not title:
-            # fallback: use pubdate as unique, only post first item for each date
-            title = f"__fallback__{dt_pub.isoformat()}"
-        if pubstr > last_pub:
-            # Newer date, always post, reset titles_at_last
-            to_post.append((dt_pub, dt_disc, item))
-        elif pubstr == last_pub:
-            if title not in titles_at_last:
-                # Same pubdate, but unseen title
-                to_post.append((dt_pub, dt_disc, item))
-        else:
-            # Older, skip
-            continue
-
-    if not to_post:
-        return
-
-    # 5) Post in chronological order
     channel = bot.get_channel(chan_id)
     if channel is None:
         logger.error(f"[{name}] Channel {chan_id} not found")
         return
 
-    # To keep state accurate, process in time order
-    to_post = sorted(to_post, key=lambda x: (x[0], x[2].get('post_title','')))
-    for dt_pub, dt_disc, item in to_post:
-        # 1) Resolve the title exactly once, including fallback
-        pubstr = dt_pub.isoformat()
-        resolved_title = item.get('post_title') or item.get('title')
-        if not resolved_title:
-            # fallback: use pubdate as unique
-            resolved_title = f"__fallback__{pubstr}"
+    async with aiohttp.ClientSession() as session:
+        # ===== Provider: RWL victims PRO (ordered by discovered DESC) =====
+        if provider == "rwl_victims_pro":
+            # 1) Load state (discovered watermark + ids at that time)
+            raw_s = state.get(state_key) or {}
+            last_disc = raw_s.get("last_seen_disc", "")
+            ids_at_last = set(raw_s.get("ids_seen_at_last_disc", []))
 
-        # 2) Send the embed
-        embed = build_dynamic_embed(feed, item)
-        await channel.send(embed=embed)
+            # 2) Fetch latest slice
+            victims = await fetch_rwl_victims_since(session, RWL_COUNTRY, limit=100)
+            if not victims:
+                return
 
-        # 3) Update state using that same resolved_title
-        if pubstr > last_pub:
-            last_pub = pubstr
-            titles_at_last = {resolved_title}
-        else:  # pubstr == last_pub
-            titles_at_last.add(resolved_title)
+            # 3) First run: seed watermark to newest discovered, no posts
+            newest_disc = victims[0].get("discovered", "")
+            if not last_disc:
+                state[state_key] = {"last_seen_disc": newest_disc, "ids_seen_at_last_disc": []}
+                save_json(STATE_FILE, state)
+                logger.info(f"[{name}] Seeded watermark {newest_disc} (no posts).")
+                return
 
-        state[state_key] = {
-            'last_seen_pub': last_pub,
-            'titles_seen_at_last_pub': list(titles_at_last)
-        }
-        save_json(STATE_FILE, state)
-        logger.info(f"[{name}] Posted: {resolved_title} at {pubstr} in channel {chan_id}")
-        await asyncio.sleep(1)
+            # 4) Collect new items (respect equals only if id not seen at last watermark)
+            to_post = []
+            for v in victims:
+                disc = v.get("discovered", "")
+                vid  = v.get("id", "")
+                if not disc or not vid:
+                    continue
+                if disc > last_disc or (disc == last_disc and vid not in ids_at_last):
+                    to_post.append(normalize_rwl_victim(v))
+
+            if not to_post:
+                return
+
+            # 5) Post oldest→newest for stable order
+            to_post.sort(key=lambda i: (parse_any_iso(i["discovered"]), i["post_title"]))
+            for item in to_post:
+                embed = build_dynamic_embed(feed, item)
+                await channel.send(embed=embed)
+                logger.info(f"[{name}] Posted: {item['post_title']} (disc {item['discovered']})")
+                await asyncio.sleep(1)
+
+            # 6) Advance watermark and ids
+            max_disc = max(parse_any_iso(i["discovered"]) for i in to_post)
+            max_disc_s = iso_utc(max_disc)
+            if max_disc_s > last_disc:
+                ids_last = [i["id"] for i in to_post if parse_any_iso(i["discovered"]) == max_disc]
+                state[state_key] = {"last_seen_disc": max_disc_s, "ids_seen_at_last_disc": ids_last}
+            else:
+                ids_last = list(ids_at_last | {i["id"] for i in to_post if i["discovered"] == last_disc})
+                state[state_key] = {"last_seen_disc": last_disc, "ids_seen_at_last_disc": ids_last}
+            save_json(STATE_FILE, state)
+            return
+
+        # ===== Legacy/free & generic JSON =====
+        # 1) Fetch JSON (no API key here)
+        headers = {'Accept': 'application/json'}
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                logger.error(f"[{name}] HTTP {resp.status}")
+                return
+            data = await resp.json()
+
+        # 2) Parse based on template timestamp (published-based)
+        tpl = feed.get('embed', {})
+        timestamp_tpl = tpl.get('timestamp', '{timestamp}')
+        raw = data if isinstance(data, list) else data.get('items', [])
+        parsed = []
+        for item in raw:
+            try:
+                dt_pub = datetime.fromisoformat(timestamp_tpl.format_map(item))
+            except:
+                dt_pub = datetime.min
+            try:
+                dt_disc = datetime.fromisoformat(item.get('discovered', '') or '1900-01-01T00:00:00')
+            except:
+                dt_disc = datetime.min
+            parsed.append((dt_pub, dt_disc, item))
+        parsed.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        if not parsed:
+            return
+
+        # 3) Load state (published + titles)
+        raw_s = state.get(state_key)
+        if isinstance(raw_s, dict):
+            last_pub = raw_s.get('last_seen_pub', '')
+            titles_at_last = set(raw_s.get('titles_seen_at_last_pub', []))
+        else:
+            last_pub = raw_s if isinstance(raw_s, str) else ''
+            titles_at_last = set()
+
+        # 4) Collect new
+        to_post = []
+        for dt_pub, dt_disc, item in parsed:
+            pubstr = dt_pub.isoformat()
+            title = item.get('post_title') or item.get('title') or f"__fallback__{pubstr}"
+            if pubstr > last_pub or (pubstr == last_pub and title not in titles_at_last):
+                to_post.append((dt_pub, dt_disc, item))
+
+        if not to_post:
+            return
+
+        # 5) Post oldest→newest for stable order
+        to_post.sort(key=lambda x: (x[0], x[2].get('post_title','')))
+        for dt_pub, dt_disc, item in to_post:
+            pubstr = dt_pub.isoformat()
+            resolved_title = item.get('post_title') or item.get('title') or f"__fallback__{pubstr}"
+            embed = build_dynamic_embed(feed, item)
+            await channel.send(embed=embed)
+
+            if pubstr > last_pub:
+                last_pub = pubstr
+                titles_at_last = {resolved_title}
+            else:
+                titles_at_last.add(resolved_title)
+
+            state[state_key] = {
+                'last_seen_pub': last_pub,
+                'titles_seen_at_last_pub': list(titles_at_last)
+            }
+            save_json(STATE_FILE, state)
+            logger.info(f"[{name}] Posted: {resolved_title} at {pubstr} in channel {chan_id}")
+            await asyncio.sleep(1)
+
+# ── RWL Pro victims fetcher ───────────────────────────────────────────────────
+async def fetch_rwl_victims_since(session: aiohttp.ClientSession, country: str, limit: int = 100, page: int = 1):
+    base = "https://api-pro.ransomware.live/victims/search"
+    q = {
+        "country": country,
+        "order": "discovered",
+        "direction": "desc",
+        "limit": limit
+    }
+    url = f"{base}?{urlencode(q)}"
+    headers = {"Accept": "application/json"}
+    if RWL_API_KEY:
+        headers["X-API-KEY"] = RWL_API_KEY
+    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"rwl pro victims HTTP {resp.status}")
+        js = await resp.json()
+    victims = js.get("victims", []) if isinstance(js, dict) else []
+    # Normalize some fields, just in case
+    for v in victims:
+        v.setdefault("permalink", v.get("post_url") or "")
+        v.setdefault("website", v.get("website") or "")
+        v["description"] = strip_html_to_text(v.get("description", ""))
+    return victims
+
+def normalize_rwl_victim(v: dict) -> dict:
+    return {
+        "post_title":  v.get("post_title") or v.get("title") or "(no title)",
+        "group_name":  v.get("group_name") or "",
+        "website":     v.get("website")    or "",
+        "description": v.get("description") or "",
+        "published":   v.get("published")   or "",
+        "discovered":  v.get("discovered")  or "",
+        "permalink":   v.get("permalink")   or v.get("post_url") or "",
+        "post_url":    v.get("post_url")    or "",
+        "id":          v.get("id")          or "",    # stable dedupe key
+        "country":     v.get("country")     or ""
+    }
 
 # ── Embed Builder ─────────────────────────────────────────────────────────────
 def build_dynamic_embed(feed, item):
@@ -326,49 +430,94 @@ def build_dynamic_embed(feed, item):
 @bot.command(name='newsaddfeed')
 @commands.cooldown(1,10,commands.BucketType.user)
 async def news_add_feed(ctx, *args):
-    if not has_moderator_role(ctx): return await ctx.send("🚫 You lack permissions.")
-    if len(args)<1:        return await ctx.send("⚠️ Usage: `!newsaddfeed <name?> <url> [interval]`")
-    
-    try:
-        interval = int(args[-1]); url = args[-2]; name = " ".join(args[:-2])
-    except:
-        interval = 5; url = args[-1]; name = " ".join(args[:-1])
-    if not url.startswith("http"): return await ctx.send("⚠️ Need a valid URL.")
+    if not has_moderator_role(ctx):
+        return await ctx.send("🚫 You lack permissions.")
+    if len(args) < 1:
+        return await ctx.send("⚠️ Usage: `!newsaddfeed <name?> <url> [interval]`")
 
-    if not name:
-        if "countryvictims" in url:
+    # Parse args: optional name, required URL, optional interval
+    try:
+        interval = int(args[-1]); url = args[-2]; name = " ".join(args[:-2]).strip()
+    except:
+        interval = 5; url = args[-1]; name = " ".join(args[:-1]).strip()
+
+    if not url.startswith(("http://","https://")):
+        return await ctx.send("⚠️ Need a valid URL (http/https).")
+
+    # Detect provider + set template + default name
+    provider = "generic_json"
+    tpl = {"embed_color":0x1ABC9C,"embed":{
+        "title":"{title}","url":"{url}","description":"{description}",
+        "timestamp":"{timestamp}","fields":[],"auto_fields":True,
+        "footer_text":"{timestamp}"}}
+
+    # ---- Pro victims (discovered) ----
+    if "api-pro.ransomware.live/victims/search" in url:
+        provider = "rwl_victims_pro"
+        tpl = RANSOMWARE_TEMPLATES["victims"]
+        qparts = []
+        if "country=" not in url:
+            qparts.append(f"country={RWL_COUNTRY}")
+        if "order=" not in url:
+            qparts.append("order=discovered")
+        if "direction=" not in url:
+            qparts.append("direction=desc")
+        if "limit=" not in url:
+            qparts.append("limit=100")
+        if qparts:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}{'&'.join(qparts)}"
+        if not name:
+            name = f"RWL Victims ({RWL_COUNTRY})"
+
+    # ---- Free victims JSON (legacy) ----
+    elif "countryvictims" in url:
+        provider = "rwl_victims_free"
+        tpl = RANSOMWARE_TEMPLATES["victims"]
+        if not name:
             cn = url.rstrip('/').split('/')[-1].upper()
             name = f"Ransomware Victims ({cn})"
-        elif "countrycyberattacks" in url:
+
+    # ---- Free cyberattacks JSON (legacy) ----
+    elif "countrycyberattacks" in url:
+        provider = "rwl_cyberattacks_free"
+        tpl = RANSOMWARE_TEMPLATES["cyberattacks"]
+        if not name:
             cn = url.rstrip('/').split('/')[-1].upper()
             name = f"Ransomware News ({cn})"
-        else:
+
+    # ---- Generic JSON fallback ----
+    else:
+        if not name:
             name = discord.utils.escape_markdown(url.split("//",1)[1].split("/",1)[0])
 
-    if any(f['url']==url and f['channel_id']==ctx.channel.id for f in feeds):
+    # Prevent duplicates in same channel (match by provider+url+channel)
+    if any(f.get('provider') == provider and f['url'] == url and f['channel_id'] == ctx.channel.id for f in feeds):
         return await ctx.send("⚠️ Feed already exists in this channel.")
-    comp = f"{url}::{ctx.channel.id}"
+
+    # Reset per-feed state key (now includes provider)
+    comp = f"{provider}:{url}::{ctx.channel.id}"
     if comp in state:
         state.pop(comp); save_json(STATE_FILE, state)
 
-    if "countryvictims" in url:
-        tpl = RANSOMWARE_TEMPLATES["victims"]
-    elif "countrycyberattacks" in url:
-        tpl = RANSOMWARE_TEMPLATES["cyberattacks"]
-    else:
-        tpl = {"embed_color":0x1ABC9C,"embed":{
-            "title":"{title}","url":"{url}","description":"{description}",
-            "timestamp":"{timestamp}","fields":[],"auto_fields":True,
-            "footer_text":"{timestamp}"}}
-
-    feed = {"name":name,"url":url,"poll_interval_minutes":interval,
-            "channel_id":ctx.channel.id,
-            "embed_color":tpl["embed_color"],"embed":tpl["embed"]}
+    # Build and persist the feed config
+    feed = {
+        "name": name,
+        "url": url,
+        "poll_interval_minutes": interval,
+        "channel_id": ctx.channel.id,
+        "embed_color": tpl["embed_color"],
+        "embed": tpl["embed"],
+        "provider": provider
+    }
     feeds.append(feed); save_json(FEEDS_FILE, feeds)
+
+    # Start task + immediate fetch
     start_feed_task(feed)
     await fetch_and_post(feed)
-    await ctx.send(f"✅ Added **{name}** every {interval} min with color `#{tpl['embed_color']:06X}`.")
-    logger.info(f"{ctx.author} used newsaddfeed command in {ctx.channel}")
+
+    await ctx.send(f"✅ Added **{name}** every {interval} min (provider: `{provider}`) with color `#{tpl['embed_color']:06X}`.")
+    logger.info(f"{ctx.author} used newsaddfeed in {ctx.channel} → {name} ({provider})")
 
 @bot.command(name='newsremovefeed')
 @commands.cooldown(1,10,commands.BucketType.user)
@@ -380,9 +529,12 @@ async def news_remove_feed(ctx, index: int):
     feed = guild_feeds[index-1]
     stop_feed_task(feed)
     feeds.remove(feed); save_json(FEEDS_FILE, feeds)
-    comp = f"{feed['url']}::{feed['channel_id']}"
+
+    provider = feed.get("provider","generic_json")
+    comp = f"{provider}:{feed['url']}::{feed['channel_id']}"
     if comp in state:
         state.pop(comp); save_json(STATE_FILE, state)
+
     await ctx.send(f"🗑️ Removed **{feed['name']}** (#{index}).")
     logger.info(f"{ctx.author} used newsremovefeed command in {ctx.channel}")
 
@@ -431,20 +583,32 @@ async def news_test(ctx, index: int):
     if not guild_feeds: return await ctx.send("No feeds here.")
     if index<1 or index>len(guild_feeds): return await ctx.send("⚠️ Invalid feed #.")
     feed = guild_feeds[index-1]
+
+    provider = feed.get("provider","generic_json")
+
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
         try:
-            async with session.get(feed['url'], headers={'Accept':'application/json'}) as resp:
-                data = await resp.json() if resp.status==200 else None
+            if provider == "rwl_victims_pro":
+                victims = await fetch_rwl_victims_since(session, RWL_COUNTRY, limit=10)
+                if not victims:
+                    return await ctx.send("No items found.")
+                item = normalize_rwl_victim(victims[0])
+                return await ctx.send(embed=build_dynamic_embed(feed, item))
+            else:
+                headers = {'Accept':'application/json'}
+                async with session.get(feed['url'], headers=headers) as resp:
+                    data = await resp.json() if resp.status==200 else None
         except asyncio.TimeoutError:
             return await ctx.send("❌ Request timed out.")
-    if not data:
-        return await ctx.send("❌ Cannot fetch feed.")
-    items = data if isinstance(data,list) else data.get('items',[])
-    if not items:
-        return await ctx.send("No items found.")
-    items.sort(key=lambda i: (i.get('published') or ''), reverse=True)
-    await ctx.send(embed=build_dynamic_embed(feed, items[0]))
-    logger.info(f"{ctx.author} used newstest command in {ctx.channel}")
+
+    if provider != "rwl_victims_pro":
+        if not data:
+            return await ctx.send("❌ Cannot fetch feed.")
+        items = data if isinstance(data,list) else data.get('items',[])
+        if not items:
+            return await ctx.send("No items found.")
+        items.sort(key=lambda i: (i.get('published') or ''), reverse=True)
+        await ctx.send(embed=build_dynamic_embed(feed, items[0]))
 
 @bot.command(name='newstimer')
 async def news_timer(ctx, index: int):
