@@ -42,7 +42,7 @@ Supports per-feed intervals, duplicate-safe watermarking, and moderator-only man
    ```bash
    python3 -m venv venv
    source venv/bin/activate
-  ```
+   ```
 
 4. **Install Python deps**
    ```bash
