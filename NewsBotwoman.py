@@ -11,7 +11,7 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from urllib.parse import urlencode
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 # ── Load env ─────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -84,7 +84,19 @@ RANSOMWARE_TEMPLATES = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-
+def canonicalize_query_url(u: str) -> str:
+    try:
+        p = urlparse(u)
+        if not p.query:
+            return u
+        q = {}
+        for k, v in parse_qsl(p.query, keep_blank_values=True):
+            q[k] = v
+        new_query = urlencode(sorted(q.items()), doseq=True)
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+    except Exception:
+        return u
+    
 def load_json(path, default):
     if os.path.exists(path):
         with open(path, 'r') as f:
@@ -154,6 +166,23 @@ async def on_ready():
         logger.info(f"Started feed task for channel ID: {feed['channel_id']}")
     logger.info("Bot is ready to receive commands")
 
+@bot.event
+async def on_command(ctx):
+    # fires when a valid command name is parsed (before it runs)
+    logger.info(f"[CMD] attempt by {ctx.author} in #{ctx.channel}: {ctx.message.content}")
+
+@bot.event
+async def on_command_completion(ctx):
+    logger.info(f"[CMD] success: {ctx.command} by {ctx.author} in #{ctx.channel}")
+
+@bot.event
+async def on_command_error(ctx, error):
+    # log unknown commands + everything else
+    if isinstance(error, commands.CommandNotFound):
+        logger.info(f"[CMD] unknown by {ctx.author} in #{ctx.channel}: {ctx.message.content}")
+        return
+    logger.error(f"[CMD] error in {ctx.command} for {ctx.author}: {error}")
+
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -178,12 +207,12 @@ async def on_connect():
 
 # ── Feed Task Management ─────────────────────────────────────────────────────
 
-
 def start_feed_task(feed):
     url = feed['url']
     chan_id = feed['channel_id']
     provider = feed.get('provider', 'generic_json')
-    key = (provider, url, chan_id)
+    key_url = canonicalize_query_url(url) if provider == "rwl_victims_pro" else url
+    key = (provider, key_url, chan_id)
 
     if key in feed_tasks:
         return
@@ -206,7 +235,9 @@ def start_feed_task(feed):
 
 def stop_feed_task(feed):
     provider = feed.get('provider', 'generic_json')
-    key = (provider, feed['url'], feed['channel_id'])
+    url = feed['url']
+    key_url = canonicalize_query_url(url) if provider == "rwl_victims_pro" else url
+    key = (provider, key_url, feed['channel_id'])
     task = feed_tasks.pop(key, None)
     if task:
         task.cancel()
@@ -217,7 +248,8 @@ async def fetch_and_post(feed):
     name     = feed.get('name', feed['url'])
     chan_id  = feed['channel_id']
     provider = feed.get("provider", "generic_json")
-    state_key = f"{provider}:{url}::{chan_id}"
+    state_key_url = canonicalize_query_url(url) if provider == "rwl_victims_pro" else url
+    state_key = f"{provider}:{state_key_url}::{chan_id}"
 
     logger.info(f"[{name}] provider={provider} url={url}")
 
@@ -543,6 +575,7 @@ def build_dynamic_embed(feed, item):
 @commands.cooldown(1, 10, commands.BucketType.user)
 async def news_add_feed(ctx, *args):
     if not has_moderator_role(ctx):
+        logger.info(f"[CMD] denied (no role): {ctx.author} tried {ctx.command} -> {ctx.message.content}")
         return await ctx.send("🚫 You lack permissions.")
     if len(args) < 1:
         return await ctx.send("⚠️ Usage: `!newsaddfeed <name?> <url> [interval]`")
@@ -616,6 +649,10 @@ async def news_add_feed(ctx, *args):
         if not name:
             name = discord.utils.escape_markdown(
                 url.split("//", 1)[1].split("/", 1)[0])
+            
+    # Normalize URL early so duplicate checks work reliably
+    if provider == "rwl_victims_pro":
+        url = canonicalize_query_url(url)
 
     # Prevent duplicates in same channel (match by provider+url+channel)
     if any(f.get('provider') == provider and f['url'] == url and f['channel_id'] == ctx.channel.id for f in feeds):
@@ -626,6 +663,10 @@ async def news_add_feed(ctx, *args):
     if comp in state:
         state.pop(comp)
         save_json(STATE_FILE, state)
+
+    # Ensure saved URL is canonical for PRO feeds (prevents key drift)
+    if provider == "rwl_victims_pro":
+        url = canonicalize_query_url(url)
 
     # Build and persist the feed config
     feed = {
@@ -763,24 +804,30 @@ async def news_test(ctx, index: int):
 
 @bot.command(name='newstimer')
 async def news_timer(ctx, index: int):
+    # List feeds in this guild
     guild_feeds = [f for f in feeds if (bot.get_channel(f['channel_id']) or discord.Object(id=0)).guild == ctx.guild]
     if not guild_feeds:
         return await ctx.send("No feeds here.")
     if index < 1 or index > len(guild_feeds):
         return await ctx.send("⚠️ Invalid feed #.")
 
-    feed = guild_feeds[index-1]
+    feed = guild_feeds[index - 1]
     provider = feed.get('provider', 'generic_json')
-    key = (provider, feed['url'], feed['channel_id']) 
-    next_time = next_poll_times.get(key)
+    url = feed['url']
 
+    key_url = canonicalize_query_url(url) if provider == "rwl_victims_pro" else url
+    key = (provider, key_url, feed['channel_id'])
+
+    next_time = next_poll_times.get(key)
     if next_time:
         now = datetime.now(CET)
         delta = next_time - now
-        minutes, seconds = divmod(int(delta.total_seconds()), 60)
+        total = max(0, int(delta.total_seconds()))
+        minutes, seconds = divmod(total, 60)
         await ctx.send(f"⏳ Next poll for **{feed['name']}** in {minutes}m {seconds}s")
     else:
         await ctx.send(f"Timer not started or no info for **{feed['name']}**.")
+
 
 
 if __name__ == '__main__':
