@@ -1,142 +1,101 @@
-# NewsBot README
+# NewsBot
 
-This guide walks you through installing, configuring, and running your NewsBot—an extensible Discord bot for polling various news APIs and posting formatted embeds.
+An extensible Discord bot that polls JSON feeds (including Ransomware.live) and posts clean, formatted embeds.  
+Supports per-feed intervals, duplicate-safe watermarking, and moderator-only management commands.
 
----
+<p align="center">
+  <!-- Optional banner -->
+  <img src="hurdurr.png" alt="NewsBot – Headlines Ticker" width="350">
+</p>
+
+## Features
+
+- Add/remove/list feeds per server (guild) with commands.
+- Per-feed polling interval (minutes).
+- Duplicate-safe posting via time-based watermarks.
+- Smart embed builder (templates for Ransomware.live **victims** and **cyberattacks**; generic JSON fallback).
+- Optional cap on posts per poll (default `MAX_POSTS_PER_POLL = 10`).
+- Friendly “next poll” timer per feed.
 
 ## Prerequisites
 
-- **Ubuntu/Debian** (or any Linux) server with root or sudo access  
-- **Python 3.9+** and **pip**  
-- A Discord bot token with **Message Content Intent** enabled  
-- A Discord channel ID where the bot will post updates  
-
----
+- Linux server (Debian/Ubuntu or similar)
+- Python **3.9+**
+- A Discord bot with **Message Content Intent** enabled
+- Channel(s) where the bot will post
 
 ## Installation
 
-1. **Update packages and install Python**
-
+1. **Install system deps**
    ```bash
    sudo apt update
-   sudo apt install python3 python3-pip python3-venv git
+   sudo apt install -y python3 python3-venv python3-pip git
    ```
 
-2. **Clone the repository**
-
+2. **Clone**
    ```bash
    git clone https://github.com/hitem/NewsBot.git
    cd NewsBot
    ```
 
-3. **Create and activate a virtual environment**
-
+3. **Create venv**
    ```bash
    python3 -m venv venv
    source venv/bin/activate
-   ```
+  ```
 
-4. **Install dependencies**
+4. **Install Python deps**
    ```bash
    pip install -r requirements.txt
    ```
 
----
-
 ## Configuration
 
-1. **Create a `.env` file** in the project root by copying the example:
-
+1. **Environment file**
    ```bash
    cp .env_example .env
    ```
-
-2. **Edit `.env`** and set your values:
-
+   Edit `.env`:
    ```ini
    DISCORD_BOT_TOKEN=your_discord_bot_token_here
+
+   # Optional (used for Ransomware.live PRO victims endpoint)
+   RWL_API_KEY=your_rwl_api_key_if_you_have_one
+   RWL_COUNTRY=SE
    ```
 
-3. Enable Developer Mode & Copy Channel ID
+2. **Developer Mode → Channel ID (optional)**
+   - Discord → ⚙️ **User Settings** → **Advanced** → enable **Developer Mode**  
+   - Right-click a channel → **Copy ID** (you’ll only need this if you seed `feeds.json` manually)
 
-   - In Discord click **User Settings** (⚙️) → **Advanced** → **Developer Mode** → **Enable**.  
-   - Navigate to the channel where you want posts, right‑click its name in the channel list, and select **Copy ID**.  
-   - Paste that numeric ID when configuring `feeds.json`.
-
-4. **Seed `feeds.json`** with at least one feed (only 1 first feed is needed, else will be added dynamicly). Example:
-
-   ```json
-   [
-   {
-     "name": "Ransomware victims (SE)",
-     "url": "https://api.ransomware.live/v2/countryvictims/SE",
-     "poll_interval_minutes": 10,
-     "channel_id": 123456789012345678,    // ← SET YOUR CHANNEL ID
-     "embed_color": 16711680,             // 0xFF0000 <- SET YOUR COLOR
-     "embed": {
-       "title":       "{post_title}",
-       "url":         "{post_url}",
-       "description": "{description}",
-       "timestamp":   "{published}",
-       "fields": [
-         {
-           "name":   "⚔️ Group",
-           "value":  "{group_name}",
-           "inline": true
-         },
-         {
-           "name":   "🌐 Website",
-           "value":  "{website}",
-           "inline": true
-         },
-         {
-           "name":   "🕵️ Discovered",
-           "value":  "{discovered}",
-           "inline": true
-         }
-       ],
-       "auto_fields": false,
-       "footer_text": "{published}"
-     }
-   }
-   ]
-
-   ```
-   Its good practice to make your own style to make the card posted to teams look better ofc. Else the bot will use a dynamic one that just adds "all fields" (which for some newsfeeds can look bulky).
-   If you have an API you want to post from, copy the JSON and ask chatgipity for a clean looking version of that feed to add to your state.json (and show that structure).
-
-5. **Initialize `state.json`** as an empty JSON object:
-
+3. **Seed state files**
+   If starting from scratch:
    ```bash
+   echo "[]" > feeds.json
    echo "{}" > state.json
    ```
+   > You can add the first feed via command (recommended), so `feeds.json` can stay empty initially.
 
 ---
 
-## Running the Bot
+## Running
 
 With your virtual environment active:
-
 ```bash
-pipenv run python NewsBotwoman.py
+source venv/bin/activate
+python NewsBotwoman.py
 ```
 
-You should see a splash banner in the logs and then periodic polling logs. The bot will post new items into the configured channel.
+You should see a startup banner and periodic polling logs. New items will be posted into the configured channel(s).
 
----
+## Run as a systemd Service (optional)
 
-## Running as a Systemd Service
-
-To keep the bot running across reboots, set it up as a systemd service:
-
-1. **Create the service file**
-
+1. **Create service file**
    ```bash
    sudo nano /etc/systemd/system/newsbot.service
    ```
 
-2. **Paste the following**, updating paths and your username:
-
+2. **Paste & edit paths/user**
    ```ini
    [Unit]
    Description=Discord NewsBot Service
@@ -156,33 +115,87 @@ To keep the bot running across reboots, set it up as a systemd service:
    WantedBy=multi-user.target
    ```
 
-3. **Enable and start the service**
-
+3. **Enable + start**
    ```bash
    sudo systemctl daemon-reload
    sudo systemctl enable newsbot
    sudo systemctl start newsbot
-   ```
-
-4. **Check status**
-
-   ```bash
    sudo systemctl status newsbot
    ```
 
----
+## Commands (Moderator-only)
 
-## Admin Commands
+> Your moderator roles are configured in code:  
+> `MODERATOR_ROLES = {"Admins", "Super Friends"}`
 
-Use the following Discord commands (moderators only) to manage feeds without editing JSON directly:
+- `!newsaddfeed <name?> <url> [interval]` — Add a feed to the **current channel**  
+  Examples:
+  ```
+  !newsaddfeed https://api.ransomware.live/v2/countryvictims/SE
+  !newsaddfeed "RWL Cyberattacks (SE)" https://api.ransomware.live/v2/countrycyberattacks/SE 10
+  !newsaddfeed "My JSON" https://example.com/feed.json 15
+  ```
+  Special handling:
+  - `api-pro.ransomware.live/victims/search` → **RWL Victims PRO** template (needs `RWL_API_KEY`)
+  - `.../countryvictims/<CC>` → **RWL victims (free)**
+  - `.../countrycyberattacks/<CC>` → **RWL cyberattacks (free)**
+  - Otherwise → generic JSON template
 
-- `!newsaddfeed <name> <url> [interval]` — Add a new feed to this channel (optional polling interval in minutes; defaults to 5)  
-- `!newsremovefeed <url>`               — Remove an existing feed by its URL  
-- `!newslistfeeds`                      — List all configured feeds and their target channels  
-- `!newssettings`                       — Show the NewsBot settings & commands help card  
-- `!newstest <feed number>`             — Fetch and display the very latest entry from the specified feed  
-- `!newstimer <feed number>`            — Show time until next poll for a feed  
+- `!newsremovefeed <#>` — Remove a feed **by index** (see list). Also clears its watermark state.  
+- `!newslistfeeds` — List all feeds in this server with indexes, channels, provider, interval.  
+- `!newstest <#>` — Fetch & display the latest entry from that feed (doesn’t persist).  
+- `!newstimer <#>` — Show time until next poll for that feed.  
+- `!newssettings` — Show this help card.
 
----
+## Providers & Templates
 
-Enjoy your dynamic, extensible NewsBot! Feel free to open an issue or contribute on GitHub.
+- **RWL Victims PRO** (`api-pro.ransomware.live/victims/search`)
+  - Uses `RWL_API_KEY` if set.
+  - Watermarking by `discovered` + a set of IDs at the same timestamp to avoid dupes.
+  - Query string is canonicalized for stable keys.
+
+- **RWL Victims Free** (`.../countryvictims/<CC>`) and **RWL Cyberattacks Free** (`.../countrycyberattacks/<CC>`)
+  - Prebuilt embed templates.
+  - Watermarking by `published` (or similar), with tie-break on titles.
+
+- **Generic JSON**
+  - Expects a list or `{ "items": [...] }`.
+  - Tries common fields (`title`, `url`, `description`, `timestamp/added/date/published`).
+  - `auto_fields: true` shows remaining keys compactly.
+
+
+## State & Duplication Control
+
+- `feeds.json` — list of configured feeds (name, url, channel_id, interval, provider, template).
+- `state.json` — watermark per **(provider + url + channel)**:
+  - PRO victims: `last_seen_disc` + `ids_seen_at_last_disc`
+  - Others: `last_seen_pub` + `titles_seen_at_last_pub`
+- First run seeds watermark to newest item (no backfill spam).
+- Per-poll cap: `MAX_POSTS_PER_POLL = 10` in code (posts oldest→newest within the new slice).
+
+## Logging
+
+Tail the service logs:
+```bash
+sudo journalctl -u newsbot -f
+```
+
+## Permissions / Intents
+
+In the Discord Developer Portal:
+
+1. Enable **Message Content Intent**.  
+2. Invite the bot with permissions:
+   - View Channels
+   - Read Message History
+   - Send Messages
+   - Embed Links
+   - (Optional) Attach Files
+
+
+## Tips
+
+- Customize the `embed` template per feed (color, fields, footer) for a cleaner card.  
+- Set `RWL_COUNTRY` in `.env` for PRO victims; defaults like `order=discovered&direction=desc&limit=100` are auto-filled if missing.  
+- If a feed changes JSON shape, run `!newstest` to inspect and then tweak the template keys.
+
