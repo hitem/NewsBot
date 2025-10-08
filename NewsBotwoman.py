@@ -36,7 +36,7 @@ STATE_FILE = 'state.json'
 MODERATOR_ROLES = {"Admins", "Super Friends"}
 CET = pytz.timezone('Europe/Stockholm')
 HELP_COOLDOWN_SECONDS = 5
-next_poll_times = {}  # key: (url, chan_id), value: datetime of next poll
+next_poll_times = {}  # key: (provider, url, chan_id) -> next poll datetime
 
 # ── Ransomware.Live embed‐templates ──────────────────────────────────────────
 RANSOMWARE_TEMPLATES = {
@@ -300,35 +300,63 @@ async def fetch_and_post(feed):
                 return
             data = await resp.json()
 
-        # 2) Parse based on template timestamp (usually 'published')
+        # 2) Parse based on template timestamp (usually 'published' or 'added')
         tpl           = feed.get('embed', {})
         timestamp_tpl = tpl.get('timestamp', '{timestamp}')
         raw_items     = data if isinstance(data, list) else data.get('items', [])
+
         parsed = []
         for it in raw_items:
-            # published (primary ordering for legacy/free feeds)
-            ts_str  = ""
+            # try several candidates: template → added → date → published
+            ts_str = ""
             try:
-                ts_str = timestamp_tpl.format_map(it)
+                ts_str = timestamp_tpl.format_map(it) or ""
             except Exception:
-                ts_str = it.get('published') or ""
-            pub_dt = parse_any_iso(ts_str)
+                ts_str = ""
+
+            if not ts_str:
+                ts_str = it.get('added') or it.get('date') or it.get('published') or ""
+
+            pub_dt  = parse_any_iso(ts_str)
             disc_dt = parse_any_iso(it.get('discovered', ""))
+
+            # Skip obviously bogus dates (prevents 0001-01-01Z spam)
+            if pub_dt.year < 1900:
+                continue
+            
             parsed.append((pub_dt, disc_dt, it))
 
         parsed.sort(key=lambda x: (x[0], x[1]), reverse=True)
         if not parsed:
             return
 
+
         # 3) Load state (published watermark + titles-at-watermark)
         raw_s = state.get(state_key)
         if isinstance(raw_s, dict):
-            last_pub      = raw_s.get('last_seen_pub', '')
+            last_pub = raw_s.get('last_seen_pub', '')
             titles_at_last = set(raw_s.get('titles_seen_at_last_pub', []))
         else:
             last_pub = raw_s if isinstance(raw_s, str) else ''
             titles_at_last = set()
         last_pub_dt = parse_any_iso(last_pub)
+
+        # --- FIRST RUN SEED for legacy/free ---
+        if not last_pub:
+            newest_pub_dt = parsed[0][0]
+            # Optionally capture titles at that same pub time to avoid equal-time dup spam later
+            same_time_titles = {
+                (it.get('post_title') or it.get('title') or f"__fallback__{iso_utc(newest_pub_dt)}")
+                for (pub_dt, _, it) in parsed if pub_dt == newest_pub_dt
+            }
+            state[state_key] = {
+                'last_seen_pub': iso_utc(newest_pub_dt),
+                'titles_seen_at_last_pub': list(same_time_titles)
+            }
+            save_json(STATE_FILE, state)
+            logger.info(f"[{name}] Seeded legacy watermark {iso_utc(newest_pub_dt)} (no posts).")
+            return
+
 
         # 4) Collect new
         to_post = []
