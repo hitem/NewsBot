@@ -27,11 +27,12 @@ logging.getLogger("discord.gateway").setLevel(logging.WARNING)
 logging.getLogger("discord.client").setLevel(logging.WARNING)
 logging.getLogger("discord.http").setLevel(logging.WARNING)
 logging.getLogger("discord.ext.commands").setLevel(logging.ERROR)
-logger.info(f"RWL_API_KEY loaded: {'yes' if RWL_API_KEY else 'no'} ({len(RWL_API_KEY) if RWL_API_KEY else 0} chars)")
+logger.info(
+    f"RWL_API_KEY loaded: {'yes' if RWL_API_KEY else 'no'} ({len(RWL_API_KEY) if RWL_API_KEY else 0} chars)")
 
 # ── Config & State ───────────────────────────────────────────────────────────
-FEEDS_FILE      = 'feeds.json'
-STATE_FILE      = 'state.json'
+FEEDS_FILE = 'feeds.json'
+STATE_FILE = 'state.json'
 MODERATOR_ROLES = {"Admins", "Super Friends"}
 CET = pytz.timezone('Europe/Stockholm')
 HELP_COOLDOWN_SECONDS = 5
@@ -47,9 +48,10 @@ RANSOMWARE_TEMPLATES = {
             "description": "{description}",
             "timestamp":   "{discovered}",
             "fields": [
-                {"name":   "⚔️ Group",    "value":  "{group_name}", "inline": True},
-                {"name":   "🌐 Website",  "value":  "{website}",    "inline": True},
-                {"name":   "🕵️ Discovered","value":  "{discovered}",  "inline": True}
+                {"name": "⚔️ Group", "value": "{group_name}", "inline": True},
+                {"name": "🌐 Website", "value": "{website_link}", "inline": True},
+                {"name": "🕵️ Discovered", "value": "{discovered}", "inline": True},
+                {"name": "🔗 Leak post", "value": "{post_link}", "inline": False}
             ],
             "auto_fields": False,
             "footer_text": "{discovered}"
@@ -63,10 +65,14 @@ RANSOMWARE_TEMPLATES = {
             "description": "{summary}",
             "timestamp":   "{added}",
             "fields": [
-                {"name": "🗓️ Alleged breach date", "value": "{date}",      "inline": True},
-                {"name": "⚔️ Gang",                "value": "{claim_gang}","inline": True},
-                {"name": "🌐 Domain",              "value": "{domain}",    "inline": True},
-                {"name": "🔗 Link",                "value": "[Read more]({link})","inline": False}
+                {"name": "🗓️ Alleged breach date",
+                    "value": "{date}",      "inline": True},
+                {"name": "⚔️ Gang",
+                    "value": "{claim_gang}", "inline": True},
+                {"name": "🌐 Domain",
+                    "value": "{domain}",    "inline": True},
+                {"name": "🔗 Link",
+                    "value": "[Read more]({link})", "inline": False}
             ],
             "auto_fields": False,
             "footer_text": "{added}"
@@ -75,22 +81,28 @@ RANSOMWARE_TEMPLATES = {
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
 def load_json(path, default):
     if os.path.exists(path):
         with open(path, 'r') as f:
             return json.load(f)
     return default
 
+
 def save_json(path, data):
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
 
+
 def has_moderator_role(ctx):
     return any(r.name in MODERATOR_ROLES for r in ctx.author.roles)
+
 
 def iso_utc(dt: datetime) -> str:
     # Always return ISO with 'Z'
     return dt.astimezone(pytz.UTC).replace(tzinfo=None).isoformat(timespec="seconds") + "Z"
+
 
 def parse_any_iso(s: str) -> datetime:
     # Accept "YYYY-MM-DD HH:MM:SS.ssssss" or "YYYY-MM-DDTHH:MM:SSZ"
@@ -109,21 +121,25 @@ def parse_any_iso(s: str) -> datetime:
     except Exception:
         return datetime.min.replace(tzinfo=pytz.UTC)
 
+
 def strip_html_to_text(s: str) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     s = re.sub(r'(?i)<br\s*/?>', '\n', s)
     s = re.sub(r'<[^>]+>', '', s)
     return html.unescape(s).strip()
 
+
 # ── State ─────────────────────────────────────────────────────────────────────
-feeds      = load_json(FEEDS_FILE, [])
-state      = load_json(STATE_FILE, {})
+feeds = load_json(FEEDS_FILE, [])
+state = load_json(STATE_FILE, {})
 feed_tasks = {}
 
 # ── Bot Setup ────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+
 
 @bot.event
 async def on_ready():
@@ -136,58 +152,72 @@ async def on_ready():
         logger.info(f"Started feed task for channel ID: {feed['channel_id']}")
     logger.info("Bot is ready to receive commands")
 
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     logger.error(f"Error in {ctx.command}: {error}")
 
+
 @bot.event
 async def on_disconnect():
     logger.warning("Lost connection to Discord…")
 
+
 @bot.event
 async def on_resumed():
     logger.info("Reconnected to Discord (session resumed)")
+
 
 @bot.event
 async def on_connect():
     logger.info("Connected to Discord gateway")
 
 # ── Feed Task Management ─────────────────────────────────────────────────────
+
+
 def start_feed_task(feed):
-    url, chan_id = feed['url'], feed['channel_id']
-    key = (url, chan_id)
+    url = feed['url']
+    chan_id = feed['channel_id']
+    provider = feed.get('provider', 'generic_json')
+    key = (provider, url, chan_id)
+
     if key in feed_tasks:
         return
 
     interval = feed.get('poll_interval_minutes', 5)
+
     @tasks.loop(minutes=interval)
     async def poll_feed():
         try:
             await fetch_and_post(feed)
         except Exception as e:
             logger.error(f"[{feed.get('name')}] Error: {e}")
-        # After finishing, set next poll time
+        # update “next poll” timestamp for this provider/url/channel
         next_poll_times[key] = datetime.now(CET) + timedelta(minutes=interval)
 
-    # Set first poll time (delayed start)
+    # set first “next poll” estimate (delayed start)
     next_poll_times[key] = datetime.now(CET) + timedelta(minutes=interval)
     feed_tasks[key] = poll_feed
     bot.loop.call_later(interval*60, poll_feed.start)
 
 def stop_feed_task(feed):
-    key = (feed['url'], feed['channel_id'])
+    provider = feed.get('provider', 'generic_json')
+    key = (provider, feed['url'], feed['channel_id'])
     task = feed_tasks.pop(key, None)
     if task:
         task.cancel()
 
 # ── Core: Fetch, Detect New, Post ─────────────────────────────────────────────
 async def fetch_and_post(feed):
-    logger.info(f"[{name}] provider={feed.get('provider')} url={url}")
-    url, name, chan_id = feed['url'], feed.get('name', feed['url']), feed['channel_id']
+    url      = feed['url']
+    name     = feed.get('name', feed['url'])
+    chan_id  = feed['channel_id']
     provider = feed.get("provider", "generic_json")
     state_key = f"{provider}:{url}::{chan_id}"
+
+    logger.info(f"[{name}] provider={provider} url={url}")
 
     channel = bot.get_channel(chan_id)
     if channel is None:
@@ -195,11 +225,13 @@ async def fetch_and_post(feed):
         return
 
     async with aiohttp.ClientSession() as session:
+
         # ===== Provider: RWL victims PRO (ordered by discovered DESC) =====
         if provider == "rwl_victims_pro":
-            # 1) Load state (discovered watermark + ids at that time)
-            raw_s = state.get(state_key) or {}
-            last_disc = raw_s.get("last_seen_disc", "")
+            # 1) Load state (watermark on discovered + ids seen at that watermark)
+            raw_s       = state.get(state_key) or {}
+            last_disc   = raw_s.get("last_seen_disc", "")
+            last_dt     = parse_any_iso(last_disc)
             ids_at_last = set(raw_s.get("ids_seen_at_last_disc", []))
 
             # 2) Fetch latest slice
@@ -207,22 +239,27 @@ async def fetch_and_post(feed):
             if not victims:
                 return
 
-            # 3) First run: seed watermark to newest discovered, no posts
+            # 3) First run → seed to newest discovered, no posts
             newest_disc = victims[0].get("discovered", "")
             if not last_disc:
-                state[state_key] = {"last_seen_disc": newest_disc, "ids_seen_at_last_disc": []}
+                newest_dt = parse_any_iso(newest_disc)
+                state[state_key] = {
+                    "last_seen_disc": iso_utc(newest_dt),
+                    "ids_seen_at_last_disc": []
+                }
                 save_json(STATE_FILE, state)
-                logger.info(f"[{name}] Seeded watermark {newest_disc} (no posts).")
+                logger.info(f"[{name}] Seeded watermark {iso_utc(newest_dt)} (no posts).")
                 return
 
-            # 4) Collect new items (respect equals only if id not seen at last watermark)
+            # 4) Collect new items
             to_post = []
             for v in victims:
                 disc = v.get("discovered", "")
                 vid  = v.get("id", "")
                 if not disc or not vid:
                     continue
-                if disc > last_disc or (disc == last_disc and vid not in ids_at_last):
+                disc_dt = parse_any_iso(disc)
+                if disc_dt > last_dt or (disc_dt == last_dt and vid not in ids_at_last):
                     to_post.append(normalize_rwl_victim(v))
 
             if not to_post:
@@ -231,20 +268,26 @@ async def fetch_and_post(feed):
             # 5) Post oldest→newest for stable order
             to_post.sort(key=lambda i: (parse_any_iso(i["discovered"]), i["post_title"]))
             for item in to_post:
+                # build + send embed
                 embed = build_dynamic_embed(feed, item)
                 await channel.send(embed=embed)
                 logger.info(f"[{name}] Posted: {item['post_title']} (disc {item['discovered']})")
                 await asyncio.sleep(1)
 
-            # 6) Advance watermark and ids
-            max_disc = max(parse_any_iso(i["discovered"]) for i in to_post)
-            max_disc_s = iso_utc(max_disc)
-            if max_disc_s > last_disc:
-                ids_last = [i["id"] for i in to_post if parse_any_iso(i["discovered"]) == max_disc]
-                state[state_key] = {"last_seen_disc": max_disc_s, "ids_seen_at_last_disc": ids_last}
+            # 6) Advance watermark and ids (store ISO/Z consistently)
+            max_disc_dt = max(parse_any_iso(i["discovered"]) for i in to_post)
+            if max_disc_dt > last_dt:
+                ids_last = [i["id"] for i in to_post if parse_any_iso(i["discovered"]) == max_disc_dt]
+                state[state_key] = {
+                    "last_seen_disc": iso_utc(max_disc_dt),
+                    "ids_seen_at_last_disc": ids_last
+                }
             else:
-                ids_last = list(ids_at_last | {i["id"] for i in to_post if i["discovered"] == last_disc})
-                state[state_key] = {"last_seen_disc": last_disc, "ids_seen_at_last_disc": ids_last}
+                ids_last = list(ids_at_last | {i["id"] for i in to_post if parse_any_iso(i["discovered"]) == last_dt})
+                state[state_key] = {
+                    "last_seen_disc": iso_utc(last_dt),
+                    "ids_seen_at_last_disc": ids_last
+                }
             save_json(STATE_FILE, state)
             return
 
@@ -257,66 +300,66 @@ async def fetch_and_post(feed):
                 return
             data = await resp.json()
 
-        # 2) Parse based on template timestamp (published-based)
-        tpl = feed.get('embed', {})
+        # 2) Parse based on template timestamp (usually 'published')
+        tpl           = feed.get('embed', {})
         timestamp_tpl = tpl.get('timestamp', '{timestamp}')
-        raw = data if isinstance(data, list) else data.get('items', [])
+        raw_items     = data if isinstance(data, list) else data.get('items', [])
         parsed = []
-        for item in raw:
+        for it in raw_items:
+            # published (primary ordering for legacy/free feeds)
+            ts_str  = ""
             try:
-                dt_pub = datetime.fromisoformat(timestamp_tpl.format_map(item))
-            except:
-                dt_pub = datetime.min
-            try:
-                dt_disc = datetime.fromisoformat(item.get('discovered', '') or '1900-01-01T00:00:00')
-            except:
-                dt_disc = datetime.min
-            parsed.append((dt_pub, dt_disc, item))
+                ts_str = timestamp_tpl.format_map(it)
+            except Exception:
+                ts_str = it.get('published') or ""
+            pub_dt = parse_any_iso(ts_str)
+            disc_dt = parse_any_iso(it.get('discovered', ""))
+            parsed.append((pub_dt, disc_dt, it))
+
         parsed.sort(key=lambda x: (x[0], x[1]), reverse=True)
         if not parsed:
             return
 
-        # 3) Load state (published + titles)
+        # 3) Load state (published watermark + titles-at-watermark)
         raw_s = state.get(state_key)
         if isinstance(raw_s, dict):
-            last_pub = raw_s.get('last_seen_pub', '')
+            last_pub      = raw_s.get('last_seen_pub', '')
             titles_at_last = set(raw_s.get('titles_seen_at_last_pub', []))
         else:
             last_pub = raw_s if isinstance(raw_s, str) else ''
             titles_at_last = set()
+        last_pub_dt = parse_any_iso(last_pub)
 
         # 4) Collect new
         to_post = []
-        for dt_pub, dt_disc, item in parsed:
-            pubstr = dt_pub.isoformat()
-            title = item.get('post_title') or item.get('title') or f"__fallback__{pubstr}"
-            if pubstr > last_pub or (pubstr == last_pub and title not in titles_at_last):
-                to_post.append((dt_pub, dt_disc, item))
+        for pub_dt, disc_dt, it in parsed:
+            title = it.get('post_title') or it.get('title') or f"__fallback__{iso_utc(pub_dt)}"
+            if pub_dt > last_pub_dt or (pub_dt == last_pub_dt and title not in titles_at_last):
+                to_post.append((pub_dt, it, title))
 
         if not to_post:
             return
 
-        # 5) Post oldest→newest for stable order
-        to_post.sort(key=lambda x: (x[0], x[2].get('post_title','')))
-        for dt_pub, dt_disc, item in to_post:
-            pubstr = dt_pub.isoformat()
-            resolved_title = item.get('post_title') or item.get('title') or f"__fallback__{pubstr}"
-            embed = build_dynamic_embed(feed, item)
+        # 5) Post oldest→newest for stable order, update state
+        to_post.sort(key=lambda x: (x[0], x[2]))
+        for pub_dt, it, resolved_title in to_post:
+            # send
+            embed = build_dynamic_embed(feed, it)
             await channel.send(embed=embed)
-
-            if pubstr > last_pub:
-                last_pub = pubstr
+            if pub_dt > last_pub_dt:
+                last_pub_dt = pub_dt
                 titles_at_last = {resolved_title}
-            else:
+            else: 
                 titles_at_last.add(resolved_title)
 
             state[state_key] = {
-                'last_seen_pub': last_pub,
+                'last_seen_pub': iso_utc(last_pub_dt),
                 'titles_seen_at_last_pub': list(titles_at_last)
             }
             save_json(STATE_FILE, state)
-            logger.info(f"[{name}] Posted: {resolved_title} at {pubstr} in channel {chan_id}")
+            logger.info(f"[{name}] Posted: {resolved_title} at {iso_utc(pub_dt)} in channel {chan_id}")
             await asyncio.sleep(1)
+
 
 # ── RWL Pro victims fetcher ───────────────────────────────────────────────────
 async def fetch_rwl_victims_since(session: aiohttp.ClientSession, country: str, limit: int = 100, page: int = 1):
@@ -343,23 +386,32 @@ async def fetch_rwl_victims_since(session: aiohttp.ClientSession, country: str, 
         v["description"] = strip_html_to_text(v.get("description", ""))
     return victims
 
+
 def normalize_rwl_victim(v: dict) -> dict:
+    site = (v.get("website") or "").strip()
+    site_url = site if site.startswith(
+        ("http://", "https://")) else (f"https://{site}" if site else "")
+    post_url = v.get("post_url") or ""
+
     return {
         "post_title":  v.get("post_title") or v.get("title") or "(no title)",
         "group_name":  v.get("group_name") or "",
-        "website":     v.get("website")    or "",
+        "website":     site,
+        "website_link": f"[{site}]({site_url})" if site_url else "",
         "description": v.get("description") or "",
-        "published":   v.get("published")   or "",
-        "discovered":  v.get("discovered")  or "",
-        "permalink":   v.get("permalink")   or v.get("post_url") or "",
-        "post_url":    v.get("post_url")    or "",
-        "id":          v.get("id")          or "",    # stable dedupe key
-        "country":     v.get("country")     or ""
+        "published":   v.get("published") or "",
+        "discovered":  v.get("discovered") or "",
+        "permalink":   v.get("permalink") or post_url,
+        "post_url":    post_url,
+        "post_link":   f"[Open original]({post_url})" if post_url else "",
+        "id":          v.get("id") or "",
+        "country":     v.get("country") or ""
     }
 
 # ── Embed Builder ─────────────────────────────────────────────────────────────
 def build_dynamic_embed(feed, item):
     tpl = feed.get('embed', {})
+
     def safe(s: str) -> str:
         try:
             return s.format_map(item)
@@ -369,13 +421,18 @@ def build_dynamic_embed(feed, item):
     title = safe(tpl.get('title')) or feed['name']
     raw_u = safe(tpl.get('url', ''))
     url   = raw_u if raw_u.startswith(('http://','https://')) else None
+    if not url:
+        # fallback to post_url if present
+        pu = item.get('post_url')
+        if isinstance(pu, str) and pu.startswith(('http://','https://')):
+            url = pu
 
-    rd = safe(tpl.get('description',''))
-    rd = re.sub(r'<br\s*/?>','\n',rd,flags=re.IGNORECASE)
-    rd = re.sub(r'<[^>]+>','',rd)
+    rd = safe(tpl.get('description', ''))
+    rd = re.sub(r'<br\s*/?>', '\n', rd, flags=re.IGNORECASE)
+    rd = re.sub(r'<[^>]+>', '', rd)
     desc = html.unescape(rd).strip() or None
 
-    ts = safe(tpl.get('timestamp',''))
+    ts = safe(tpl.get('timestamp', ''))
     try:
         dt = datetime.fromisoformat(ts)
     except:
@@ -395,61 +452,81 @@ def build_dynamic_embed(feed, item):
     embed.set_author(name=feed['name'])
 
     for fld in tpl.get('fields', []):
-        name = fld.get('name','')
-        rawv = fld.get('value','')
-        if not name or not rawv: continue
+        name = fld.get('name', '')
+        rawv = fld.get('value', '')
+        if not name or not rawv:
+            continue
         val = safe(rawv)
         if name == "🔗 Link":
             m = re.search(r'\((https?://[^\)]+)\)', val)
             if m:
-                link = re.sub(r'(ransomware\.live/id)(?!/)',r'\1/',m.group(1))
+                link = re.sub(r'(ransomware\.live/id)(?!/)',
+                              r'\1/', m.group(1))
                 val = f"[Read more]({link})"
-        embed.add_field(name=name, value=val, inline=fld.get('inline',True))
+        embed.add_field(name=name, value=val, inline=fld.get('inline', True))
 
     if tpl.get('auto_fields', False):
         shown = {f['name'] for f in tpl.get('fields', [])}
-        for k,v in item.items():
-            if k in shown: continue
+        for k, v in item.items():
+            if k in shown:
+                continue
             t = str(v)
-            if len(t)>100: t = t[:100].rsplit(' ',1)[0] + '…'
+            if len(t) > 100:
+                t = t[:100].rsplit(' ', 1)[0] + '…'
             embed.add_field(name=k, value=t, inline=True)
 
     if 'ransomware.live/v2/countryvictims/' in feed['url']:
         try:
             c = feed['url'].rstrip('/').split('/')[-1].upper()
             m = f"https://www.ransomware.live/map/{c.lower()}"
-            embed.add_field(name="🔗 View on Ransomware.Live", value=f"[Open map for {c}]({m})", inline=False)
+            embed.add_field(name="🔗 View on Ransomware.Live",
+                            value=f"[Open map for {c}]({m})", inline=False)
         except:
             pass
 
-    ftxt = tpl.get('footer_text','{timestamp}')
+    ftxt = tpl.get('footer_text', '{timestamp}')
     embed.set_footer(text=safe(ftxt))
     return embed
 
 # ── Admin Commands ────────────────────────────────────────────────────────────
+
+
 @bot.command(name='newsaddfeed')
-@commands.cooldown(1,10,commands.BucketType.user)
+@commands.cooldown(1, 10, commands.BucketType.user)
 async def news_add_feed(ctx, *args):
     if not has_moderator_role(ctx):
         return await ctx.send("🚫 You lack permissions.")
     if len(args) < 1:
         return await ctx.send("⚠️ Usage: `!newsaddfeed <name?> <url> [interval]`")
 
-    # Parse args: optional name, required URL, optional interval
-    try:
-        interval = int(args[-1]); url = args[-2]; name = " ".join(args[:-2]).strip()
-    except:
-        interval = 5; url = args[-1]; name = " ".join(args[:-1]).strip()
+    # to avoid UnboundLocalError
+    name = ""
+    url = ""
+    interval = 5
 
-    if not url.startswith(("http://","https://")):
+    # 1 arg: just URL
+    if len(args) == 1:
+        url = args[0]
+
+    # 2+ args: maybe trailing interval
+    else:
+        try:
+            interval = int(args[-1])
+            url = args[-2]
+            name = " ".join(args[:-2]).strip()
+        except ValueError:
+            url = args[-1]
+            name = " ".join(args[:-1]).strip()
+
+    if not url.startswith(("http://", "https://")):
         return await ctx.send("⚠️ Need a valid URL (http/https).")
 
     # Detect provider + set template + default name
     provider = "generic_json"
-    tpl = {"embed_color":0x1ABC9C,"embed":{
-        "title":"{title}","url":"{url}","description":"{description}",
-        "timestamp":"{timestamp}","fields":[],"auto_fields":True,
-        "footer_text":"{timestamp}"}}
+    tpl = {"embed_color": 0x1ABC9C, "embed": {
+        "title": "{title}", "url": "{url}", "description": "{description}",
+        "timestamp": "{timestamp}", "fields": [], "auto_fields": True,
+        "footer_text": "{timestamp}"}}
 
     # ---- Pro victims (discovered) ----
     if "api-pro.ransomware.live/victims/search" in url:
@@ -489,7 +566,8 @@ async def news_add_feed(ctx, *args):
     # ---- Generic JSON fallback ----
     else:
         if not name:
-            name = discord.utils.escape_markdown(url.split("//",1)[1].split("/",1)[0])
+            name = discord.utils.escape_markdown(
+                url.split("//", 1)[1].split("/", 1)[0])
 
     # Prevent duplicates in same channel (match by provider+url+channel)
     if any(f.get('provider') == provider and f['url'] == url and f['channel_id'] == ctx.channel.id for f in feeds):
@@ -498,7 +576,8 @@ async def news_add_feed(ctx, *args):
     # Reset per-feed state key (now includes provider)
     comp = f"{provider}:{url}::{ctx.channel.id}"
     if comp in state:
-        state.pop(comp); save_json(STATE_FILE, state)
+        state.pop(comp)
+        save_json(STATE_FILE, state)
 
     # Build and persist the feed config
     feed = {
@@ -510,45 +589,62 @@ async def news_add_feed(ctx, *args):
         "embed": tpl["embed"],
         "provider": provider
     }
-    feeds.append(feed); save_json(FEEDS_FILE, feeds)
+    feeds.append(feed)
+    save_json(FEEDS_FILE, feeds)
 
     # Start task + immediate fetch
     start_feed_task(feed)
     await fetch_and_post(feed)
 
     await ctx.send(f"✅ Added **{name}** every {interval} min (provider: `{provider}`) with color `#{tpl['embed_color']:06X}`.")
-    logger.info(f"{ctx.author} used newsaddfeed in {ctx.channel} → {name} ({provider})")
+    logger.info(
+        f"{ctx.author} used newsaddfeed in {ctx.channel} → {name} ({provider})")
+
 
 @bot.command(name='newsremovefeed')
-@commands.cooldown(1,10,commands.BucketType.user)
+@commands.cooldown(1, 10, commands.BucketType.user)
 async def news_remove_feed(ctx, index: int):
-    if not has_moderator_role(ctx): return await ctx.send("🚫 You lack permissions.")
-    guild_feeds = [f for f in feeds if (bot.get_channel(f['channel_id']) or discord.Object(id=0)).guild == ctx.guild]
-    if not guild_feeds: return await ctx.send("No feeds here.")
-    if index<1 or index>len(guild_feeds): return await ctx.send("⚠️ Invalid feed #.")
+    if not has_moderator_role(ctx):
+        return await ctx.send("🚫 You lack permissions.")
+    guild_feeds = [f for f in feeds if (bot.get_channel(
+        f['channel_id']) or discord.Object(id=0)).guild == ctx.guild]
+    if not guild_feeds:
+        return await ctx.send("No feeds here.")
+    if index < 1 or index > len(guild_feeds):
+        return await ctx.send("⚠️ Invalid feed #.")
     feed = guild_feeds[index-1]
     stop_feed_task(feed)
-    feeds.remove(feed); save_json(FEEDS_FILE, feeds)
+    feeds.remove(feed)
+    save_json(FEEDS_FILE, feeds)
 
-    provider = feed.get("provider","generic_json")
+    provider = feed.get("provider", "generic_json")
     comp = f"{provider}:{feed['url']}::{feed['channel_id']}"
     if comp in state:
-        state.pop(comp); save_json(STATE_FILE, state)
+        state.pop(comp)
+        save_json(STATE_FILE, state)
 
     await ctx.send(f"🗑️ Removed **{feed['name']}** (#{index}).")
     logger.info(f"{ctx.author} used newsremovefeed command in {ctx.channel}")
 
 @bot.command(name='newslistfeeds')
 async def news_list_feeds(ctx):
-    if not has_moderator_role(ctx): return await ctx.send("🚫 You lack permissions.")
+    if not has_moderator_role(ctx):
+        return await ctx.send("🚫 You lack permissions.")
+
     guild_feeds = [f for f in feeds if (bot.get_channel(f['channel_id']) or discord.Object(id=0)).guild == ctx.guild]
-    if not guild_feeds: return await ctx.send("No feeds here.")
-    lines=[]
-    for i,f in enumerate(guild_feeds,1):
+    if not guild_feeds:
+        return await ctx.send("No feeds here.")
+
+    lines = []
+    for i, f in enumerate(guild_feeds, 1):
         ch = bot.get_channel(f['channel_id'])
         mention = ch.mention if ch else f"`{f['channel_id']}`"
-        lines.append(f"{i}. **{f['name']}** → {mention} every {f['poll_interval_minutes']} min\n<{f['url']}>")
-    await ctx.send("**Configured feeds:**\n"+"\n".join(lines))
+        prov = f.get('provider', 'generic_json')
+        lines.append(
+            f"{i}. **{f['name']}** [{prov}] → {mention} every {f['poll_interval_minutes']} min\n<{f['url']}>"
+        )
+
+    await ctx.send("**Configured feeds:**\n" + "\n".join(lines))
     logger.info(f"{ctx.author} used newslistfeeds command in {ctx.channel}")
 
 async def attach_embed_info(ctx, embed: discord.Embed) -> discord.Embed:
@@ -561,6 +657,7 @@ async def attach_embed_info(ctx, embed: discord.Embed) -> discord.Embed:
     embed.set_footer(text="by: hitem")
     return embed
 
+
 @bot.command(name='newssettings')
 @commands.cooldown(1, HELP_COOLDOWN_SECONDS, commands.BucketType.user)
 async def news_settings(ctx):
@@ -572,19 +669,24 @@ async def news_settings(ctx):
         "- `!newssettings` — Show this help card.\n"
         "- `!newstimer <#>` — Show time until next poll for a feed.\n"
     )
-    embed = discord.Embed(title="NewsBot Help", description=help_text, colour=0x1ABC9C)
+    embed = discord.Embed(title="NewsBot Help",
+                          description=help_text, colour=0x1ABC9C)
     embed = await attach_embed_info(ctx, embed)
     await ctx.send(embed=embed)
     logger.info(f"{ctx.author} used newssettings command in {ctx.channel}")
 
+
 @bot.command(name='newstest')
 async def news_test(ctx, index: int):
-    guild_feeds = [f for f in feeds if (bot.get_channel(f['channel_id']) or discord.Object(id=0)).guild == ctx.guild]
-    if not guild_feeds: return await ctx.send("No feeds here.")
-    if index<1 or index>len(guild_feeds): return await ctx.send("⚠️ Invalid feed #.")
+    guild_feeds = [f for f in feeds if (bot.get_channel(
+        f['channel_id']) or discord.Object(id=0)).guild == ctx.guild]
+    if not guild_feeds:
+        return await ctx.send("No feeds here.")
+    if index < 1 or index > len(guild_feeds):
+        return await ctx.send("⚠️ Invalid feed #.")
     feed = guild_feeds[index-1]
 
-    provider = feed.get("provider","generic_json")
+    provider = feed.get("provider", "generic_json")
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
         try:
@@ -595,20 +697,21 @@ async def news_test(ctx, index: int):
                 item = normalize_rwl_victim(victims[0])
                 return await ctx.send(embed=build_dynamic_embed(feed, item))
             else:
-                headers = {'Accept':'application/json'}
+                headers = {'Accept': 'application/json'}
                 async with session.get(feed['url'], headers=headers) as resp:
-                    data = await resp.json() if resp.status==200 else None
+                    data = await resp.json() if resp.status == 200 else None
         except asyncio.TimeoutError:
             return await ctx.send("❌ Request timed out.")
 
     if provider != "rwl_victims_pro":
         if not data:
             return await ctx.send("❌ Cannot fetch feed.")
-        items = data if isinstance(data,list) else data.get('items',[])
+        items = data if isinstance(data, list) else data.get('items', [])
         if not items:
             return await ctx.send("No items found.")
         items.sort(key=lambda i: (i.get('published') or ''), reverse=True)
         await ctx.send(embed=build_dynamic_embed(feed, items[0]))
+
 
 @bot.command(name='newstimer')
 async def news_timer(ctx, index: int):
@@ -617,9 +720,12 @@ async def news_timer(ctx, index: int):
         return await ctx.send("No feeds here.")
     if index < 1 or index > len(guild_feeds):
         return await ctx.send("⚠️ Invalid feed #.")
+
     feed = guild_feeds[index-1]
-    key = (feed['url'], feed['channel_id'])
+    provider = feed.get('provider', 'generic_json')
+    key = (provider, feed['url'], feed['channel_id']) 
     next_time = next_poll_times.get(key)
+
     if next_time:
         now = datetime.now(CET)
         delta = next_time - now
@@ -627,7 +733,7 @@ async def news_timer(ctx, index: int):
         await ctx.send(f"⏳ Next poll for **{feed['name']}** in {minutes}m {seconds}s")
     else:
         await ctx.send(f"Timer not started or no info for **{feed['name']}**.")
-    logger.info(f"{ctx.author} used newstimer command in {ctx.channel}")
+
 
 if __name__ == '__main__':
     bot.run(TOKEN)
