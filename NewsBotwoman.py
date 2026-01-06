@@ -143,6 +143,8 @@ def strip_html_to_text(s: str) -> str:
     s = re.sub(r'<[^>]+>', '', s)
     return html.unescape(s).strip()
 
+def at_second(dt: datetime) -> datetime:
+    return dt.replace(microsecond=0)
 
 # ── State ─────────────────────────────────────────────────────────────────────
 feeds = load_json(FEEDS_FILE, [])
@@ -182,14 +184,6 @@ async def on_command_error(ctx, error):
         logger.info(f"[CMD] unknown by {ctx.author} in #{ctx.channel}: {ctx.message.content}")
         return
     logger.error(f"[CMD] error in {ctx.command} for {ctx.author}: {error}")
-
-
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        return
-    logger.error(f"Error in {ctx.command}: {error}")
-
 
 @bot.event
 async def on_disconnect():
@@ -300,7 +294,7 @@ async def fetch_and_post(feed):
                 if not disc or not vid:
                     continue
                 disc_dt = parse_any_iso(disc)
-                if disc_dt > last_dt or (disc_dt == last_dt and vid not in ids_at_last):
+                if at_second(disc_dt) > at_second(last_dt) or (at_second(disc_dt) == at_second(last_dt) and vid not in ids_at_last):
                     to_post.append(normalize_rwl_victim(v))
 
             if not to_post:
@@ -321,17 +315,19 @@ async def fetch_and_post(feed):
                 await asyncio.sleep(1)
 
             # 6) Advance watermark and ids (store ISO/Z consistently)
-            max_disc_dt = max(parse_any_iso(i["discovered"]) for i in to_post)
-            if max_disc_dt > last_dt:
-                ids_last = [i["id"] for i in to_post if parse_any_iso(i["discovered"]) == max_disc_dt]
+            max_disc_sec = max(at_second(parse_any_iso(i["discovered"])) for i in to_post)
+            if max_disc_sec > at_second(last_dt):
+                ids_last = [i["id"] for i in to_post if at_second(parse_any_iso(i["discovered"])) == max_disc_sec]
                 state[state_key] = {
-                    "last_seen_disc": iso_utc(max_disc_dt),
+                    "last_seen_disc": iso_utc(max_disc_sec), 
                     "ids_seen_at_last_disc": ids_last
                 }
             else:
-                ids_last = list(ids_at_last | {i["id"] for i in to_post if parse_any_iso(i["discovered"]) == last_dt})
+                ids_last = list(ids_at_last | {
+                    i["id"] for i in to_post if at_second(parse_any_iso(i["discovered"])) == at_second(last_dt)
+                })
                 state[state_key] = {
-                    "last_seen_disc": iso_utc(last_dt),
+                    "last_seen_disc": iso_utc(at_second(last_dt)),
                     "ids_seen_at_last_disc": ids_last
                 }
             save_json(STATE_FILE, state)
@@ -513,10 +509,7 @@ def build_dynamic_embed(feed, item):
     desc = html.unescape(rd).strip() or None
 
     ts = safe(tpl.get('timestamp', ''))
-    try:
-        dt = datetime.fromisoformat(ts)
-    except:
-        dt = datetime.now(CET)
+    dt = parse_any_iso(ts) if ts else datetime.now(CET)
 
     embed = discord.Embed(
         title=title,
