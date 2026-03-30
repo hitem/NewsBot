@@ -336,11 +336,24 @@ async def fetch_and_post(feed):
         # ===== Legacy/free & generic JSON =====
         # 1) Fetch JSON (no API key here)
         headers = {'Accept': 'application/json'}
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                logger.error(f"[{name}] HTTP {resp.status}")
+        data = None
+        for attempt in range(2):  # first try + 1 retry
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    break
+                
+                if resp.status == 504 and attempt == 0:
+                    retry_delay = 60  # change to 60 for 1 minute
+                    logger.warning(f"[{name}] channel={chan_id} HTTP 504, retrying once in {retry_delay}s... url={url}")
+                    await asyncio.sleep(retry_delay)
+                    continue
+                
+                logger.error(f"[{name}] channel={chan_id} HTTP {resp.status} url={url}")
                 return
-            data = await resp.json()
+
+        if data is None:
+            return
 
         # 2) Parse based on template timestamp (usually 'published' or 'added')
         tpl           = feed.get('embed', {})
@@ -450,10 +463,23 @@ async def fetch_rwl_victims_since(session: aiohttp.ClientSession, country: str, 
     headers = {"Accept": "application/json"}
     if RWL_API_KEY:
         headers["X-API-KEY"] = RWL_API_KEY
-    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-        if resp.status != 200:
+    js = None
+    for attempt in range(2):  # first try + 1 retry
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                js = await resp.json()
+                break
+
+            if resp.status == 504 and attempt == 0:
+                retry_delay = 20  # change to 60 for 1 minute
+                logger.warning(f"[RWL PRO] HTTP 504, retrying once in {retry_delay}s... url={url}")
+                await asyncio.sleep(retry_delay)
+                continue
+
             raise RuntimeError(f"rwl pro victims HTTP {resp.status}")
-        js = await resp.json()
+
+    if js is None:
+        raise RuntimeError("rwl pro victims: no data after retry")
     victims = js.get("victims", []) if isinstance(js, dict) else []
     # Normalize some fields, just in case
     for v in victims:
