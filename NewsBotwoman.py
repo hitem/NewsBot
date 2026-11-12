@@ -4,7 +4,9 @@ import logging
 import re
 import html
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from xml.etree import ElementTree as ET
 
 import pytz
 import aiohttp
@@ -40,6 +42,10 @@ HELP_COOLDOWN_SECONDS = 5
 next_poll_times = {}  # key: (provider, url, chan_id) -> next poll datetime
 MAX_POSTS_PER_POLL = 10  # Maximum successful posts per feed poll
 ARTICLE_HISTORY_LIMIT = 500  # Maximum remembered articles PER Discord channel
+FEED_CACHE_SECONDS = 60  # Share fresh responses for one minute across channels
+FEED_CACHE_MAX_ENTRIES = 12  # Bounded response cache for Raspberry Pi 3
+FEED_MAX_RESPONSE_BYTES = 2_000_000  # Reject unexpectedly large feeds
+FEED_429_FALLBACK_SECONDS = 600  # Used only if server omits Retry-After
 
 # ── Ransomware.Live embed‐templates ──────────────────────────────────────────
 RANSOMWARE_TEMPLATES = {
@@ -151,7 +157,7 @@ def at_second(dt: datetime) -> datetime:
     return dt.replace(microsecond=0)
 
 
-def article_aliases(item: dict, provider: str = '') -> list:
+def article_aliases(item: dict, provider: str = '', source_url: str = '') -> list:
     """Match stable URL(s)/ID; use title only if no stable identity exists."""
     aliases = []
     for field in ('url', 'link', 'permalink', 'post_url'):
@@ -174,7 +180,10 @@ def article_aliases(item: dict, provider: str = '') -> list:
             continue
     stable_id = item.get('id')
     if stable_id is not None and str(stable_id).strip():
-        aliases.append(f'id:{provider}:' + str(stable_id).strip())
+        # Generic RSS/JSON IDs can be reused by unrelated publishers (e.g. GUID "1").
+        # Scope non-RWL IDs to their source feed; URLs still dedupe across sources.
+        id_scope = provider if provider.startswith('rwl_') else f'{provider}:{canonicalize_query_url(source_url)}'
+        aliases.append(f'id:{id_scope}:' + str(stable_id).strip())
     if not aliases:
         title = item.get('post_title') or item.get('title')
         if isinstance(title, str) and title.strip():
@@ -212,6 +221,10 @@ feeds = load_json(FEEDS_FILE, [])
 state = load_json(STATE_FILE, {})
 feed_tasks = {}
 channel_locks = {}  # prevent overlapping polls from posting to one channel simultaneously
+feed_request_locks = {}  # one HTTP fetch per URL at a time, even across channels
+feed_response_cache = {}  # URL -> (expiry_monotonic, parsed_response, etag, modified)
+feed_retry_at = {}  # URL -> monotonic timestamp when retry is allowed
+feed_host_retry_at = {}  # Host -> shared cooldown when a publisher rate-limits us
 
 # ── Bot Setup ────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -299,6 +312,284 @@ def stop_feed_task(feed):
     if task:
         task.cancel()
 
+# ── Provider-neutral HTTP fetch and feed parsing ────────────────────────────
+def is_rwl_pro_api_url(url: str) -> bool:
+    """Only send the RWL key to the official HTTPS PRO API host."""
+    try:
+        parsed = urlparse(url)
+        return (
+            parsed.scheme.lower() == 'https'
+            and parsed.hostname == 'api-pro.ransomware.live'
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except (ValueError, TypeError):
+        return False
+
+
+def parse_feed_datetime(value):
+    """Accept ISO 8601 (Atom/JSON), RFC 822 (RSS), and existing API timestamps."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    dt = parse_any_iso(value)
+    if dt.year >= 1999:
+        return dt
+    try:
+        dt = parsedate_to_datetime(value)
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def xml_local(tag):
+    return tag.rsplit('}', 1)[-1] if isinstance(tag, str) else ''
+
+
+def xml_child(node, local, namespace=None):
+    for child in node:
+        if xml_local(child.tag) == local and (namespace is None or child.tag.startswith('{' + namespace + '}')):
+            return child
+    return None
+
+
+def xml_text(node, names):
+    for name in names:
+        child = xml_child(node, name)
+        if child is not None:
+            text = ''.join(child.itertext()).strip()
+            if text:
+                return text
+    return ''
+
+
+def parse_syndication_xml(content):
+    """Normalize common RSS 2.0, RSS 1.0 (RDF) and Atom XML articles."""
+    # Reject DTDs/entity definitions: feeds are untrusted input.
+    upper_start = content.upper()
+    if b'<!DOCTYPE' in upper_start or b'<!ENTITY' in upper_start:
+        raise ValueError('Feed XML contains forbidden DTD/entity declaration')
+    root = ET.fromstring(content)
+    root_type = xml_local(root.tag).lower()
+
+    if root_type == 'rss':
+        channel = xml_child(root, 'channel')
+        entries = [c for c in channel if xml_local(c.tag) == 'item'] if channel is not None else []
+    elif root_type == 'rdf':
+        entries = [c for c in root if xml_local(c.tag) == 'item']
+    elif root_type == 'feed':
+        entries = [c for c in root if xml_local(c.tag) == 'entry']
+    else:
+        raise ValueError(f'Unsupported XML root: {root_type}')
+
+    items = []
+    for entry in entries:
+        is_atom = root_type == 'feed'
+        title = xml_text(entry, ('title',)) or '(untitled)'
+        if is_atom:
+            links = [c for c in entry if xml_local(c.tag) == 'link']
+            link = next((e.attrib.get('href', '') for e in links
+                         if e.attrib.get('rel', 'alternate') == 'alternate' and e.attrib.get('href')), '')
+            if not link:
+                link = next((e.attrib.get('href', '') for e in links if e.attrib.get('href')), '')
+            published = xml_text(entry, ('published', 'updated'))
+            item_id = xml_text(entry, ('id',))
+            description = xml_text(entry, ('summary', 'content'))
+        else:
+            link = xml_text(entry, ('link',))
+            published = xml_text(entry, ('pubDate', 'date', 'published', 'updated'))
+            item_id = xml_text(entry, ('guid', 'id'))
+            description = xml_text(entry, ('description', 'encoded', 'summary'))
+
+        dt = parse_feed_datetime(published)
+        # No date means we cannot safely decide if the entry is new.
+        if dt is None:
+            logger.warning('RSS/Atom article skipped (invalid/missing date): %s', title[:100])
+            continue
+        if not link and not item_id:
+            logger.warning('RSS/Atom article skipped (no URL or GUID): %s', title[:100])
+            continue
+        items.append({
+            'title': title,
+            'url': link,
+            'link': link,
+            'id': item_id,
+            'description': strip_html_to_text(description),
+            'timestamp': iso_utc(dt),
+        })
+    return items
+
+
+def normalize_generic_json(data):
+    """Parse JSON arrays, JSON Feed items, and APIs returning a results array."""
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = data.get('items')
+        if not isinstance(items, list):
+            items = data.get('results', [])
+    else:
+        items = []
+    if not isinstance(items, list):
+        return []
+
+    normalized = []
+    for original in items:
+        if not isinstance(original, dict):
+            continue
+        item = dict(original)
+        item.setdefault('timestamp', item.get('date_published') or item.get('published')
+                        or item.get('added') or item.get('date') or item.get('discovered') or '')
+        item.setdefault('description', item.get('summary') or item.get('content_text')
+                        or item.get('content_html') or '')
+        item.setdefault('url', item.get('external_url') or item.get('link') or '')
+        # RWL PRO press items have `url` and optional nested `ransomware.group`,
+        # rather than the legacy free API's flat `link` and `claim_gang` fields.
+        item.setdefault('link', item.get('url') or '')
+        ransomware = item.get('ransomware')
+        if isinstance(ransomware, dict):
+            item.setdefault('claim_gang', ransomware.get('group') or '')
+        else:
+            item.setdefault('claim_gang', '')
+        normalized.append(item)
+    return normalized
+
+
+def retry_after_seconds(header_value):
+    if header_value:
+        try:
+            return max(1, int(float(header_value)))
+        except (ValueError, TypeError, OverflowError):
+            try:
+                dt = parsedate_to_datetime(header_value)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return max(1, int((dt - datetime.now(timezone.utc)).total_seconds()))
+            except (TypeError, ValueError, IndexError, OverflowError):
+                pass
+    return FEED_429_FALLBACK_SECONDS
+
+
+async def fetch_shared_feed(session, url, name, extra_headers=None):
+    """Reusable JSON/XML fetcher with bounded cache, backoff and per-host auth."""
+    loop = asyncio.get_running_loop()
+    lock = feed_request_locks.setdefault(url, asyncio.Lock())
+    async with lock:
+        now = loop.time()
+        cached = feed_response_cache.get(url)
+        if cached and cached[0] > now:
+            return cached[1]
+
+        # Prune expired cooldowns so removed feeds don't leave stale entries.
+        if len(feed_retry_at) > 32:
+            feed_retry_at_keys = [key for key, expiry in feed_retry_at.items() if expiry <= now]
+            for key in feed_retry_at_keys:
+                feed_retry_at.pop(key, None)
+        if len(feed_host_retry_at) > 32:
+            for key in [key for key, expiry in feed_host_retry_at.items() if expiry <= now]:
+                feed_host_retry_at.pop(key, None)
+        host = urlparse(url).netloc.lower()
+        blocked_until = max(feed_retry_at.get(url, 0), feed_host_retry_at.get(host, 0))
+        if now < blocked_until:
+            logger.info('[%s] Feed cooldown: %.0fs left for %s', name, blocked_until-now, url)
+            return None
+
+        headers = {'Accept': 'application/json, application/feed+json, application/rss+xml, '
+                             'application/atom+xml, application/xml, text/xml'}
+        if extra_headers:
+            headers.update(extra_headers)
+
+        # Apply credentials centrally for every RWL PRO endpoint, regardless of
+        # feed provider name. Never send this credential to the free API or
+        # unrelated hosts. Do not put credentials in feeds.json or URLs.
+        rwl_pro = is_rwl_pro_api_url(url)
+        if rwl_pro:
+            if not RWL_API_KEY:
+                logger.error('[%s] RWL PRO feed requires RWL_API_KEY in .env: %s', name, url)
+                return None
+            headers['X-API-KEY'] = RWL_API_KEY
+        if cached:
+            if cached[2]:
+                headers['If-None-Match'] = cached[2]
+            if cached[3]:
+                headers['If-Modified-Since'] = cached[3]
+
+        try:
+            # A PRO endpoint must not automatically forward X-API-KEY via an
+            # HTTP redirect to a different domain.
+            async with session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=30),
+                allow_redirects=not rwl_pro
+            ) as response:
+                if response.status == 304:
+                    if cached:
+                        feed_response_cache[url] = (loop.time() + FEED_CACHE_SECONDS, cached[1], cached[2], cached[3])
+                        return cached[1]
+                    logger.warning('[%s] HTTP 304 without cached data: %s', name, url)
+                    return None
+
+                if response.status in (429, 503):
+                    cooldown = retry_after_seconds(response.headers.get('Retry-After'))
+                    feed_retry_at[url] = loop.time() + cooldown
+                    # Publishers often enforce host-wide quotas rather than URL-specific limits.
+                    feed_host_retry_at[host] = loop.time() + cooldown
+                    logger.warning('[%s] HTTP %s; backing off %ss for %s', name, response.status, cooldown, url)
+                    return None
+
+                if response.status in (500, 502, 504):
+                    feed_retry_at[url] = loop.time() + 60
+                    logger.warning('[%s] HTTP %s; backing off 60s for %s', name, response.status, url)
+                    return None
+
+                if response.status != 200:
+                    logger.error('[%s] HTTP %s for %s', name, response.status, url)
+                    return None
+
+                if response.content_length and response.content_length > FEED_MAX_RESPONSE_BYTES:
+                    logger.error('[%s] Feed exceeds %s bytes: %s', name, FEED_MAX_RESPONSE_BYTES, url)
+                    return None
+                # Limit actual bytes even when the server omits Content-Length.
+                chunks = []
+                received = 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    received += len(chunk)
+                    if received > FEED_MAX_RESPONSE_BYTES:
+                        logger.error('[%s] Feed exceeds %s bytes: %s', name, FEED_MAX_RESPONSE_BYTES, url)
+                        return None
+                    chunks.append(chunk)
+                content = b''.join(chunks)
+
+                kind = response.headers.get('Content-Type', '').lower()
+                if 'json' in kind or content.lstrip().startswith((b'{', b'[')):
+                    data = json.loads(content.decode('utf-8-sig'))
+                elif ('xml' in kind or 'rss' in kind or 'atom' in kind
+                      or content.lstrip().startswith(b'<')):
+                    data = parse_syndication_xml(content)
+                else:
+                    logger.error('[%s] Unsupported feed format (%s): %s', name, kind, url)
+                    return None
+                if not isinstance(data, (list, dict)):
+                    logger.error('[%s] Unexpected feed payload: %s', name, url)
+                    return None
+
+                # Don't store unlimited old feeds in RAM.
+                if len(feed_response_cache) >= FEED_CACHE_MAX_ENTRIES and url not in feed_response_cache:
+                    oldest = min(feed_response_cache, key=lambda key: feed_response_cache[key][0])
+                    del feed_response_cache[oldest]
+                feed_response_cache[url] = (
+                    loop.time() + FEED_CACHE_SECONDS,
+                    data,
+                    response.headers.get('ETag'),
+                    response.headers.get('Last-Modified'),
+                )
+                feed_retry_at.pop(url, None)
+                return data
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError,
+                ET.ParseError, UnicodeDecodeError, ValueError) as exc:
+            logger.warning('[%s] Feed fetch/parse failed for %s: %s', name, url, exc)
+            return None
+
+
 # ── Core: Fetch, Detect New, Post ─────────────────────────────────────────────
 async def fetch_and_post(feed):
     url = feed['url']
@@ -319,28 +610,20 @@ async def fetch_and_post(feed):
     async with lock:
         async with aiohttp.ClientSession() as session:
             if provider == 'rwl_victims_pro':
-                victims = await fetch_rwl_victims_since(session, RWL_COUNTRY, limit=100)
-                items = [normalize_rwl_victim(v) for v in victims]
+                data = await fetch_shared_feed(session, url, name)
+                if data is None:
+                    return
+                victims = data.get('victims', []) if isinstance(data, dict) else []
+                items = [normalize_rwl_victim(v) for v in victims if isinstance(v, dict)]
                 timestamp_fields = ('discovered', 'published')
                 watermark_field = 'last_seen_disc'
                 titles_field = 'ids_seen_at_last_disc'
             else:
-                data = None
-                for attempt in range(2):
-                    async with session.get(url, headers={'Accept': 'application/json'}) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            break
-                        if response.status == 504 and attempt == 0:
-                            logger.warning(f"[{name}] HTTP 504; retrying in 60s")
-                            await asyncio.sleep(60)
-                            continue
-                        logger.error(f"[{name}] HTTP {response.status} for {url}")
-                        return
+                data = await fetch_shared_feed(session, url, name)
                 if data is None:
-                    return
-                items = data if isinstance(data, list) else data.get('items', [])
-                timestamp_fields = ('added', 'published', 'date', 'timestamp', 'discovered')
+                    return  # Keep watermarks untouched on failed/rate-limited fetch
+                items = normalize_generic_json(data)
+                timestamp_fields = ('added', 'published', 'date_published', 'date', 'timestamp', 'discovered')
                 watermark_field = 'last_seen_pub'
                 titles_field = 'titles_seen_at_last_pub'
 
@@ -353,7 +636,7 @@ async def fetch_and_post(feed):
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                aliases = article_aliases(item, provider)
+                aliases = article_aliases(item, provider, url)
                 if not aliases:
                     logger.warning(f"[{name}] Skipping article without URL, ID or title")
                     continue
@@ -374,6 +657,8 @@ async def fetch_and_post(feed):
                 if pub_dt > poll_now:
                     logger.warning(f"[{name}] Skipping future-dated article: {aliases[0]} at {iso_utc(pub_dt)}")
                     continue
+                # Persisted watermarks use whole seconds; compare at the same precision.
+                pub_dt = at_second(pub_dt)
                 title = str(item.get('post_title') or item.get('title') or '(untitled)')
                 parsed.append((pub_dt, title, item, aliases))
 
@@ -408,6 +693,11 @@ async def fetch_and_post(feed):
             # First run after updating old code: remember older articles already
             # covered by the existing watermark, without re-posting them.
             if not previous.get('_dedup_bootstrapped'):
+                # Carry forward all old PRO IDs from the last watermark.
+                # This also protects against an API changing 'discovered' later.
+                if provider == 'rwl_victims_pro':
+                    for prior_id in seen_at_watermark:
+                        remember_post(channel_key, [f'id:{provider}:{prior_id}'])
                 for dt, title, item, aliases in parsed:
                     if dt < last_dt or (dt == last_dt and tie_key(item, title) in seen_at_watermark):
                         remember_post(channel_key, aliases)
@@ -467,41 +757,21 @@ async def fetch_and_post(feed):
 
 # ── RWL Pro victims fetcher ───────────────────────────────────────────────────
 async def fetch_rwl_victims_since(session: aiohttp.ClientSession, country: str, limit: int = 100, page: int = 1):
-    base = "https://api-pro.ransomware.live/victims/search"
-    q = {
-        "country": country,
-        "order": "discovered",
-        "direction": "desc",
-        "limit": limit
-    }
-    url = f"{base}?{urlencode(q)}"
-    headers = {"Accept": "application/json"}
-    if RWL_API_KEY:
-        headers["X-API-KEY"] = RWL_API_KEY
-    js = None
-    for attempt in range(2):  # first try + 1 retry
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 200:
-                js = await resp.json()
-                break
+    """RWL-specific JSON mapping only. HTTP retries/caching are provider-neutral."""
+    url = 'https://api-pro.ransomware.live/victims/search?' + urlencode({
+        'country': country, 'order': 'discovered', 'direction': 'desc', 'limit': limit
+    })
+    data = await fetch_shared_feed(session, canonicalize_query_url(url), 'RWL PRO')
+    victims = data.get('victims', []) if isinstance(data, dict) else []
+    if not isinstance(victims, list):
+        return []
+    for victim in victims:
+        if isinstance(victim, dict):
+            victim.setdefault('permalink', victim.get('post_url') or '')
+            victim.setdefault('website', victim.get('website') or '')
+            victim['description'] = strip_html_to_text(victim.get('description', ''))
+    return [victim for victim in victims if isinstance(victim, dict)]
 
-            if resp.status == 504 and attempt == 0:
-                retry_delay = 20  # change to 60 for 1 minute
-                logger.warning(f"[RWL PRO] HTTP 504, retrying once in {retry_delay}s... url={url}")
-                await asyncio.sleep(retry_delay)
-                continue
-
-            raise RuntimeError(f"rwl pro victims HTTP {resp.status}")
-
-    if js is None:
-        raise RuntimeError("rwl pro victims: no data after retry")
-    victims = js.get("victims", []) if isinstance(js, dict) else []
-    # Normalize some fields, just in case
-    for v in victims:
-        v.setdefault("permalink", v.get("post_url") or "")
-        v.setdefault("website", v.get("website") or "")
-        v["description"] = strip_html_to_text(v.get("description", ""))
-    return victims
 
 
 def normalize_rwl_victim(v: dict) -> dict:
@@ -515,7 +785,7 @@ def normalize_rwl_victim(v: dict) -> dict:
         "group_name":  v.get("group_name") or "",
         "website":     site,
         "website_link": f"[{site}]({site_url})" if site_url else "",
-        "description": v.get("description") or "",
+        "description": strip_html_to_text(v.get("description") or ""),
         "published":   v.get("published") or "",
         "discovered":  v.get("discovered") or "",
         "permalink":   v.get("permalink") or post_url,
@@ -634,7 +904,7 @@ async def news_add_feed(ctx, *args):
         return await ctx.send("⚠️ Need a valid URL (http/https).")
 
     # Detect provider + set template + default name
-    provider = "generic_json"
+    provider = "generic_feed"
     tpl = {"embed_color": 0x1ABC9C, "embed": {
         "title": "{title}", "url": "{url}", "description": "{description}",
         "timestamp": "{timestamp}", "fields": [], "auto_fields": True,
@@ -659,6 +929,13 @@ async def news_add_feed(ctx, *args):
         if not name:
             name = f"RWL Victims ({RWL_COUNTRY})"
 
+    # ---- RWL PRO press JSON ----
+    elif is_rwl_pro_api_url(url) and urlparse(url).path.startswith('/press/'):
+        provider = 'rwl_press_pro'
+        tpl = RANSOMWARE_TEMPLATES['cyberattacks']
+        if not name:
+            name = 'RWL Press'
+
     # ---- Free victims JSON (legacy) ----
     elif "countryvictims" in url:
         provider = "rwl_victims_free"
@@ -675,7 +952,7 @@ async def news_add_feed(ctx, *args):
             cn = url.rstrip('/').split('/')[-1].upper()
             name = f"Ransomware News ({cn})"
 
-    # ---- Generic JSON fallback ----
+    # ---- Generic JSON, JSON Feed, RSS and Atom fallback (content auto-detected) ----
     else:
         if not name:
             name = discord.utils.escape_markdown(
@@ -817,19 +1094,17 @@ async def news_test(ctx, index: int):
                 item = normalize_rwl_victim(victims[0])
                 return await ctx.send(embed=build_dynamic_embed(feed, item))
             else:
-                headers = {'Accept': 'application/json'}
-                async with session.get(feed['url'], headers=headers) as resp:
-                    data = await resp.json() if resp.status == 200 else None
+                data = await fetch_shared_feed(session, feed['url'], feed.get('name', 'Feed test'))
         except asyncio.TimeoutError:
             return await ctx.send("❌ Request timed out.")
 
     if provider != "rwl_victims_pro":
-        if not data:
+        if data is None:
             return await ctx.send("❌ Cannot fetch feed.")
-        items = data if isinstance(data, list) else data.get('items', [])
+        items = normalize_generic_json(data)
         if not items:
             return await ctx.send("No items found.")
-        items.sort(key=lambda i: (i.get('published') or ''), reverse=True)
+        items.sort(key=lambda i: parse_feed_datetime(str(i.get('timestamp') or '')) or datetime.min.replace(tzinfo=pytz.UTC), reverse=True)
         await ctx.send(embed=build_dynamic_embed(feed, items[0]))
 
 
