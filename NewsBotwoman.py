@@ -38,7 +38,9 @@ MODERATOR_ROLES = {"Admins", "Super Friends"}
 CET = pytz.timezone('Europe/Stockholm')
 HELP_COOLDOWN_SECONDS = 5
 next_poll_times = {}  # key: (provider, url, chan_id) -> next poll datetime
-MAX_POSTS_PER_POLL = 10 # cap incase bananas api
+MAX_POSTS_PER_POLL = 10  # Maximum successful posts per feed poll
+ARTICLE_HISTORY_LIMIT = 500  # Maximum remembered articles PER Discord channel
+LATE_ARRIVAL_LOOKBACK_DAYS = 7  # Accept articles dated up to 7 days before last watermark
 
 # ── Ransomware.Live embed‐templates ──────────────────────────────────────────
 RANSOMWARE_TEMPLATES = {
@@ -105,8 +107,11 @@ def load_json(path, default):
 
 
 def save_json(path, data):
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
+    # Atomic replace prevents an interrupted write from corrupting state.json.
+    tmp = f"{path}.tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
 
 
 def has_moderator_role(ctx):
@@ -146,10 +151,68 @@ def strip_html_to_text(s: str) -> str:
 def at_second(dt: datetime) -> datetime:
     return dt.replace(microsecond=0)
 
+
+def article_aliases(item: dict, provider: str = '') -> list:
+    """Match stable URL(s)/ID; use title only if no stable identity exists."""
+    aliases = []
+    for field in ('url', 'link', 'permalink', 'post_url'):
+        raw = item.get(field)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            parts = urlparse(raw.strip())
+            if parts.scheme.lower() not in ('http', 'https') or not parts.hostname:
+                continue
+            host = parts.netloc.lower()
+            if host.startswith('www.'):
+                host = host[4:]
+            path = parts.path.rstrip('/') or '/'
+            params = sorted((k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                            if not k.lower().startswith('utm_') and k.lower() not in ('fbclid', 'gclid'))
+            canonical = urlunparse(('https', host, path, '', urlencode(params), ''))
+            aliases.append('url:' + canonical)
+        except (ValueError, TypeError):
+            continue
+    stable_id = item.get('id')
+    if stable_id is not None and str(stable_id).strip():
+        aliases.append(f'id:{provider}:' + str(stable_id).strip())
+    if not aliases:
+        title = item.get('post_title') or item.get('title')
+        if isinstance(title, str) and title.strip():
+            aliases.append('title:' + ' '.join(title.lower().split()))
+    return sorted(set(aliases))
+
+
+def channel_history_key(channel) -> str:
+    # Includes the server explicitly. Never mix history between channels.
+    return f"{channel.guild.id}:{channel.id}"
+
+
+def has_been_posted(channel_key: str, aliases: list) -> bool:
+    history = state.get('_posted_articles', {}).get(channel_key, [])
+    keys = set(aliases)
+    return bool(keys) and any(keys.intersection(entry['aliases']) for entry in history)
+
+
+def remember_post(channel_key: str, aliases: list) -> bool:
+    if not aliases or has_been_posted(channel_key, aliases):
+        return False
+    per_channel = state.setdefault('_posted_articles', {})
+    history = per_channel.setdefault(channel_key, [])
+    history.append({'aliases': aliases})
+    del history[:-ARTICLE_HISTORY_LIMIT]
+    return True
+
+
+def truncate_text(value, limit: int) -> str:
+    text = '' if value is None else str(value)
+    return text if len(text) <= limit else text[:limit - 1] + '…'
+
 # ── State ─────────────────────────────────────────────────────────────────────
 feeds = load_json(FEEDS_FILE, [])
 state = load_json(STATE_FILE, {})
 feed_tasks = {}
+channel_locks = {}  # prevent overlapping polls from posting to one channel simultaneously
 
 # ── Bot Setup ────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -163,6 +226,7 @@ async def on_ready():
     logger.info("#   Created by hitem      #github.com/hitem       NewsBot   #")
     logger.info("#############################################################")
     logger.info(f"Logged in as {bot.user.name}")
+    logger.info(f"State file: {os.path.abspath(STATE_FILE)}")
     for feed in feeds:
         start_feed_task(feed)
         logger.info(f"Started feed task for channel ID: {feed['channel_id']}")
@@ -218,7 +282,7 @@ def start_feed_task(feed):
         try:
             await fetch_and_post(feed)
         except Exception as e:
-            logger.error(f"[{feed.get('name')}] Error: {e}")
+            logger.exception(f"[{feed.get('name')}] Poll failed")
         # update “next poll” timestamp for this provider/url/channel
         next_poll_times[key] = datetime.now(CET) + timedelta(minutes=interval)
 
@@ -238,216 +302,153 @@ def stop_feed_task(feed):
 
 # ── Core: Fetch, Detect New, Post ─────────────────────────────────────────────
 async def fetch_and_post(feed):
-    url      = feed['url']
-    name     = feed.get('name', feed['url'])
-    chan_id  = feed['channel_id']
-    provider = feed.get("provider", "generic_json")
-    state_key_url = canonicalize_query_url(url) if provider == "rwl_victims_pro" else url
+    url = feed['url']
+    name = feed.get('name', url)
+    chan_id = feed['channel_id']
+    provider = feed.get('provider', 'generic_json')
+    state_key_url = canonicalize_query_url(url) if provider == 'rwl_victims_pro' else url
     state_key = f"{provider}:{state_key_url}::{chan_id}"
-
-    logger.info(f"[{name}] provider={provider} url={url}")
 
     channel = bot.get_channel(chan_id)
     if channel is None:
         logger.error(f"[{name}] Channel {chan_id} not found")
         return
+    channel_key = channel_history_key(channel)
 
-    async with aiohttp.ClientSession() as session:
+    # A shared lock protects channels that have multiple feeds (or an immediate fetch).
+    lock = channel_locks.setdefault(channel_key, asyncio.Lock())
+    async with lock:
+        async with aiohttp.ClientSession() as session:
+            if provider == 'rwl_victims_pro':
+                victims = await fetch_rwl_victims_since(session, RWL_COUNTRY, limit=100)
+                items = [normalize_rwl_victim(v) for v in victims]
+                timestamp_fields = ('discovered', 'published')
+                watermark_field = 'last_seen_disc'
+                titles_field = 'ids_seen_at_last_disc'
+            else:
+                data = None
+                for attempt in range(2):
+                    async with session.get(url, headers={'Accept': 'application/json'}) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            break
+                        if response.status == 504 and attempt == 0:
+                            logger.warning(f"[{name}] HTTP 504; retrying in 60s")
+                            await asyncio.sleep(60)
+                            continue
+                        logger.error(f"[{name}] HTTP {response.status} for {url}")
+                        return
+                if data is None:
+                    return
+                items = data if isinstance(data, list) else data.get('items', [])
+                timestamp_fields = ('added', 'published', 'date', 'timestamp', 'discovered')
+                watermark_field = 'last_seen_pub'
+                titles_field = 'titles_seen_at_last_pub'
 
-        # ===== Provider: RWL victims PRO (ordered by discovered DESC) =====
-        if provider == "rwl_victims_pro":
-            # 1) Load state (watermark on discovered + ids seen at that watermark)
-            raw_s       = state.get(state_key) or {}
-            last_disc   = raw_s.get("last_seen_disc", "")
-            last_dt     = parse_any_iso(last_disc)
-            ids_at_last = set(raw_s.get("ids_seen_at_last_disc", []))
-
-            # 2) Fetch latest slice
-            victims = await fetch_rwl_victims_since(session, RWL_COUNTRY, limit=100)
-            if not victims:
+            if not isinstance(items, list) or not items:
                 return
 
-            # 3) First run → seed to newest discovered, no posts
-            newest_disc = victims[0].get("discovered", "")
-            if not last_disc:
-                newest_dt = parse_any_iso(newest_disc)
+            parsed = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                aliases = article_aliases(item, provider)
+                if not aliases:
+                    logger.warning(f"[{name}] Skipping article without URL, ID or title")
+                    continue
+                # Use the configured timestamp when available; other fields as fallback.
+                tpl_value = None
+                if provider != 'rwl_victims_pro':
+                    try:
+                        tpl_value = feed.get('embed', {}).get('timestamp', '').format_map(item)
+                    except (KeyError, TypeError, ValueError, AttributeError):
+                        pass
+                candidates = [tpl_value] + [item.get(field) for field in timestamp_fields]
+                pub_dt = next((dt for value in candidates
+                               if isinstance(value, str) and (dt := parse_any_iso(value)).year >= 1999), None)
+                if pub_dt is None:
+                    logger.warning(f"[{name}] Article has no valid timestamp; using fetch time: {aliases[0]}")
+                    pub_dt = datetime.now(pytz.UTC)
+                title = str(item.get('post_title') or item.get('title') or '(untitled)')
+                parsed.append((pub_dt, title, item, aliases))
 
-                # capture all IDs that share the newest discovered timestamp
-                ids_at_watermark = [
-                    v.get("id") for v in victims
-                    if parse_any_iso(v.get("discovered","")) == newest_dt and v.get("id")
-                ]
+            if not parsed:
+                return
+            parsed.sort(key=lambda row: (row[0], row[1]))
 
+            raw = state.get(state_key)
+            previous = raw if isinstance(raw, dict) else {}
+            last_seen = previous.get(watermark_field, raw if isinstance(raw, str) else '')
+            last_dt = parse_any_iso(last_seen)
+            seen_at_watermark = set(previous.get(titles_field, []))
+
+            def tie_key(item, title):
+                return str(item.get('id') or '') if provider == 'rwl_victims_pro' else title
+
+            # New feed: seed all currently visible articles so adding it never floods Discord.
+            if not last_seen:
+                newest = parsed[-1][0]
+                at_newest = {tie_key(item, title) for dt, title, item, _ in parsed if dt == newest}
+                for _, _, _, aliases in parsed:
+                    remember_post(channel_key, aliases)
                 state[state_key] = {
-                    "last_seen_disc": iso_utc(newest_dt),
-                    "ids_seen_at_last_disc": ids_at_watermark 
+                    watermark_field: iso_utc(newest),
+                    titles_field: sorted(at_newest),
+                    '_dedup_bootstrapped': True
                 }
                 save_json(STATE_FILE, state)
-                logger.info(f"[{name}] Seeded watermark {iso_utc(newest_dt)} with {len(ids_at_watermark)} id(s).")
+                logger.info(f"[{name}] New feed seeded; no historical posts")
                 return
 
-            # 4) Collect new items
-            to_post = []
-            for v in victims:
-                disc = v.get("discovered", "")
-                vid  = v.get("id", "")
-                if not disc or not vid:
+            # First run after updating old code: remember older articles already
+            # covered by the existing watermark, without re-posting them.
+            if not previous.get('_dedup_bootstrapped'):
+                for dt, title, item, aliases in parsed:
+                    if dt < last_dt or (dt == last_dt and tie_key(item, title) in seen_at_watermark):
+                        remember_post(channel_key, aliases)
+                previous['_dedup_bootstrapped'] = True
+                state[state_key] = previous
+                save_json(STATE_FILE, state)
+
+            # Lookback allows items to arrive late with earlier publication dates.
+            cutoff = last_dt - timedelta(days=LATE_ARRIVAL_LOOKBACK_DAYS)
+            pending = [row for row in parsed
+                       if row[0] >= cutoff and not has_been_posted(channel_key, row[3])]
+            if not pending:
+                return
+
+            sent = 0
+            for pub_dt, title, item, aliases in pending:
+                if sent >= MAX_POSTS_PER_POLL:
+                    break
+                if has_been_posted(channel_key, aliases):
                     continue
-                disc_dt = parse_any_iso(disc)
-                if at_second(disc_dt) > at_second(last_dt) or (at_second(disc_dt) == at_second(last_dt) and vid not in ids_at_last):
-                    to_post.append(normalize_rwl_victim(v))
+                try:
+                    embed = build_dynamic_embed(feed, item)
+                    await channel.send(embed=embed)
+                except Exception:
+                    # One bad article must not block the other news in the batch.
+                    logger.exception(f"[{name}] Failed to post {title!r}; other articles will continue")
+                    continue
 
-            if not to_post:
-                return
-
-            # 5) Post oldest→newest for stable order
-            to_post.sort(key=lambda i: (parse_any_iso(i["discovered"]), i["post_title"]))
-
-            # hard cap per poll — take the oldest N 
-            if len(to_post) > MAX_POSTS_PER_POLL:
-                logger.info(f"[{name}] Capping {len(to_post)} new items to {MAX_POSTS_PER_POLL} this poll.")
-            to_post = to_post[:MAX_POSTS_PER_POLL]
-
-            for item in to_post:
-                embed = build_dynamic_embed(feed, item)
-                await channel.send(embed=embed)
-                logger.info(f"[{name}] Posted: {item['post_title']} (disc {item['discovered']})")
+                remember_post(channel_key, aliases)
+                if pub_dt > last_dt:
+                    last_dt = pub_dt
+                    seen_at_watermark = {tie_key(item, title)}
+                elif pub_dt == last_dt:
+                    seen_at_watermark.add(tie_key(item, title))
+                state[state_key] = {
+                    watermark_field: iso_utc(last_dt),
+                    titles_field: sorted(seen_at_watermark)[-ARTICLE_HISTORY_LIMIT:],
+                    '_dedup_bootstrapped': True
+                }
+                save_json(STATE_FILE, state)
+                sent += 1
+                logger.info(f"[{name}] Posted {title!r} to guild={channel.guild.id} channel={chan_id}")
                 await asyncio.sleep(1)
 
-            # 6) Advance watermark and ids (store ISO/Z consistently)
-            max_disc_sec = max(at_second(parse_any_iso(i["discovered"])) for i in to_post)
-            if max_disc_sec > at_second(last_dt):
-                ids_last = [i["id"] for i in to_post if at_second(parse_any_iso(i["discovered"])) == max_disc_sec]
-                state[state_key] = {
-                    "last_seen_disc": iso_utc(max_disc_sec), 
-                    "ids_seen_at_last_disc": ids_last
-                }
-            else:
-                ids_last = list(ids_at_last | {
-                    i["id"] for i in to_post if at_second(parse_any_iso(i["discovered"])) == at_second(last_dt)
-                })
-                state[state_key] = {
-                    "last_seen_disc": iso_utc(at_second(last_dt)),
-                    "ids_seen_at_last_disc": ids_last
-                }
-            save_json(STATE_FILE, state)
-            return
-
-        # ===== Legacy/free & generic JSON =====
-        # 1) Fetch JSON (no API key here)
-        headers = {'Accept': 'application/json'}
-        data = None
-        for attempt in range(2):  # first try + 1 retry
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    break
-                
-                if resp.status == 504 and attempt == 0:
-                    retry_delay = 60  # change to 60 for 1 minute
-                    logger.warning(f"[{name}] channel={chan_id} HTTP 504, retrying once in {retry_delay}s... url={url}")
-                    await asyncio.sleep(retry_delay)
-                    continue
-                
-                logger.error(f"[{name}] channel={chan_id} HTTP {resp.status} url={url}")
-                return
-
-        if data is None:
-            return
-
-        # 2) Parse based on template timestamp (usually 'published' or 'added')
-        tpl           = feed.get('embed', {})
-        timestamp_tpl = tpl.get('timestamp', '{timestamp}')
-        raw_items     = data if isinstance(data, list) else data.get('items', [])
-
-        parsed = []
-        for it in raw_items:
-            # try several candidates: template → added → date → published
-            ts_str = ""
-            try:
-                ts_str = timestamp_tpl.format_map(it) or ""
-            except Exception:
-                ts_str = ""
-
-            if not ts_str:
-                ts_str = it.get('added') or it.get('date') or it.get('published') or ""
-
-            pub_dt  = parse_any_iso(ts_str)
-            disc_dt = parse_any_iso(it.get('discovered', ""))
-
-            # Skip obviously bogus dates (prevents 0001-01-01Z spam)
-            if pub_dt.year < 1999:
-                continue
-            
-            parsed.append((pub_dt, disc_dt, it))
-
-        parsed.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        if not parsed:
-            return
-
-
-        # 3) Load state (published watermark + titles-at-watermark)
-        raw_s = state.get(state_key)
-        if isinstance(raw_s, dict):
-            last_pub = raw_s.get('last_seen_pub', '')
-            titles_at_last = set(raw_s.get('titles_seen_at_last_pub', []))
-        else:
-            last_pub = raw_s if isinstance(raw_s, str) else ''
-            titles_at_last = set()
-        last_pub_dt = parse_any_iso(last_pub)
-
-        # --- FIRST RUN SEED for legacy/free ---
-        if not last_pub:
-            newest_pub_dt = parsed[0][0]
-            # Optionally capture titles at that same pub time to avoid equal-time dup spam later
-            same_time_titles = {
-                (it.get('post_title') or it.get('title') or f"__fallback__{iso_utc(newest_pub_dt)}")
-                for (pub_dt, _, it) in parsed if pub_dt == newest_pub_dt
-            }
-            state[state_key] = {
-                'last_seen_pub': iso_utc(newest_pub_dt),
-                'titles_seen_at_last_pub': list(same_time_titles)
-            }
-            save_json(STATE_FILE, state)
-            logger.info(f"[{name}] Seeded legacy watermark {iso_utc(newest_pub_dt)} (no posts).")
-            return
-
-
-        # 4) Collect new
-        to_post = []
-        for pub_dt, disc_dt, it in parsed:
-            title = it.get('post_title') or it.get('title') or f"__fallback__{iso_utc(pub_dt)}"
-            if pub_dt > last_pub_dt or (pub_dt == last_pub_dt and title not in titles_at_last):
-                to_post.append((pub_dt, it, title))
-
-        if not to_post:
-            return
-
-        # 5) Post oldest→newest for stable order, update state
-        to_post.sort(key=lambda x: (x[0], x[2]))
-
-        # hard cap per poll — take the oldest N
-        if len(to_post) > MAX_POSTS_PER_POLL:
-            logger.info(f"[{name}] Capping {len(to_post)} new items to {MAX_POSTS_PER_POLL} this poll.")
-        to_post = to_post[:MAX_POSTS_PER_POLL]
-
-
-        for pub_dt, it, resolved_title in to_post:
-            embed = build_dynamic_embed(feed, it)
-            await channel.send(embed=embed)
-            if pub_dt > last_pub_dt:
-                last_pub_dt = pub_dt
-                titles_at_last = {resolved_title}
-            else: 
-                titles_at_last.add(resolved_title)
-
-            state[state_key] = {
-                'last_seen_pub': iso_utc(last_pub_dt),
-                'titles_seen_at_last_pub': list(titles_at_last)
-            }
-            save_json(STATE_FILE, state)
-            logger.info(f"[{name}] Posted: {resolved_title} at {iso_utc(pub_dt)} in channel {chan_id}")
-            await asyncio.sleep(1)
+            if len(pending) > sent:
+                logger.info(f"[{name}] {len(pending) - sent} items left pending or failed this poll")
 
 
 # ── RWL Pro victims fetcher ───────────────────────────────────────────────────
@@ -514,77 +515,74 @@ def normalize_rwl_victim(v: dict) -> dict:
 def build_dynamic_embed(feed, item):
     tpl = feed.get('embed', {})
 
-    def safe(s: str) -> str:
+    def safe(template):
         try:
-            return s.format_map(item)
-        except:
+            return template.format_map(item) if isinstance(template, str) else ''
+        except (KeyError, TypeError, ValueError, AttributeError):
             return ''
 
-    title = safe(tpl.get('title')) or feed['name']
-    raw_u = safe(tpl.get('url', ''))
-    url   = raw_u if raw_u.startswith(('http://','https://')) else None
+    title = truncate_text(safe(tpl.get('title')) or feed['name'], 256)
+    raw_url = safe(tpl.get('url', ''))
+    url = raw_url if raw_url.startswith(('https://', 'http://')) else None
     if not url:
-        # fallback to post_url if present
-        pu = item.get('post_url')
-        if isinstance(pu, str) and pu.startswith(('http://','https://')):
-            url = pu
+        fallback_url = item.get('post_url') or item.get('permalink')
+        if isinstance(fallback_url, str) and fallback_url.startswith(('https://', 'http://')):
+            url = fallback_url
 
-    rd = safe(tpl.get('description', ''))
-    rd = re.sub(r'<br\s*/?>', '\n', rd, flags=re.IGNORECASE)
-    rd = re.sub(r'<[^>]+>', '', rd)
-    desc = html.unescape(rd).strip() or None
-
+    raw_description = safe(tpl.get('description', ''))
+    description = truncate_text(strip_html_to_text(raw_description), 3500) or None
     ts = safe(tpl.get('timestamp', ''))
-    dt = parse_any_iso(ts) if ts else datetime.now(CET)
+    dt = parse_any_iso(ts) if ts else None
+    if dt is not None and dt.year < 1999:
+        dt = None
 
     embed = discord.Embed(
         title=title,
         url=url,
-        description=desc,
+        description=description,
         timestamp=dt,
         color=feed.get('embed_color', 0x1ABC9C)
     )
     website = item.get('domain') or item.get('website')
-    if website:
-        logo = f"https://logo.clearbit.com/{website.lower().strip()}?size=128"
-        embed.set_thumbnail(url=logo)
-    embed.set_author(name=feed['name'])
+    if isinstance(website, str) and website.strip():
+        embed.set_thumbnail(url=f"https://logo.clearbit.com/{website.lower().strip()}?size=128")
+    embed.set_author(name=truncate_text(feed['name'], 256))
 
-    for fld in tpl.get('fields', []):
-        name = fld.get('name', '')
-        rawv = fld.get('value', '')
-        if not name or not rawv:
+    def add_field(field_name, value, inline=True):
+        if not value or len(embed.fields) >= 25:
+            return
+        field_name = truncate_text(field_name, 256)
+        available = min(1024, 5800 - len(embed) - len(field_name))
+        if available > 0:
+            embed.add_field(name=field_name, value=truncate_text(value, available), inline=inline)
+
+    for field in tpl.get('fields', []):
+        field_name = field.get('name', '')
+        if not field_name:
             continue
-        val = safe(rawv)
-        if name == "🔗 Link":
-            m = re.search(r'\((https?://[^\)]+)\)', val)
-            if m:
-                link = re.sub(r'(ransomware\.live/id)(?!/)',
-                              r'\1/', m.group(1))
-                val = f"[Read more]({link})"
-        embed.add_field(name=name, value=val, inline=fld.get('inline', True))
+        value = safe(field.get('value', ''))
+        if field_name == '🔗 Link':
+            match = re.search(r'\((https?://[^)]+)\)', value)
+            if match:
+                link = re.sub(r'(ransomware\.live/id)(?!/)', r'\1/', match.group(1))
+                value = f"[Read more]({link})"
+        add_field(field_name, value, field.get('inline', True))
 
     if tpl.get('auto_fields', False):
-        shown = {f['name'] for f in tpl.get('fields', [])}
-        for k, v in item.items():
-            if k in shown:
-                continue
-            t = str(v)
-            if len(t) > 100:
-                t = t[:100].rsplit(' ', 1)[0] + '…'
-            embed.add_field(name=k, value=t, inline=True)
+        shown = {field.get('name') for field in tpl.get('fields', [])}
+        for key, value in item.items():
+            if key not in shown:
+                add_field(key, truncate_text(value, 100))
 
     if 'ransomware.live/v2/countryvictims/' in feed['url']:
-        try:
-            c = feed['url'].rstrip('/').split('/')[-1].upper()
-            m = f"https://www.ransomware.live/map/{c.lower()}"
-            embed.add_field(name="🔗 View on Ransomware.Live",
-                            value=f"[Open map for {c}]({m})", inline=False)
-        except:
-            pass
+        country = feed['url'].rstrip('/').split('/')[-1].upper()
+        add_field('🔗 View on Ransomware.Live',
+                  f"[Open map for {country}](https://www.ransomware.live/map/{country.lower()})", False)
 
-    ftxt = tpl.get('footer_text', '{timestamp}')
-    embed.set_footer(text=safe(ftxt))
+    footer = safe(tpl.get('footer_text', '{timestamp}'))
+    available = min(2048, 5900 - len(embed))
+    if footer and available > 0:
+        embed.set_footer(text=truncate_text(footer, available))
     return embed
 
 # ── Admin Commands ────────────────────────────────────────────────────────────
