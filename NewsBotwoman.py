@@ -698,12 +698,21 @@ async def fetch_and_post(feed):
                 if provider == 'rwl_victims_pro':
                     for prior_id in seen_at_watermark:
                         remember_post(channel_key, [f'id:{provider}:{prior_id}'])
+                bootstrapped_count = 0
                 for dt, title, item, aliases in parsed:
-                    if dt < last_dt or (dt == last_dt and tie_key(item, title) in seen_at_watermark):
-                        remember_post(channel_key, aliases)
+                    # When migrating a feed, all articles at or before the saved
+                    # watermark are historical, including equal-date entries.
+                    # Do not post unseen articles from that old date on first run.
+                    if dt <= last_dt:
+                        if remember_post(channel_key, aliases):
+                            bootstrapped_count += 1
+                        if dt == last_dt:
+                            seen_at_watermark.add(tie_key(item, title))
+                previous[titles_field] = sorted(seen_at_watermark)[-ARTICLE_HISTORY_LIMIT:]
                 previous['_dedup_bootstrapped'] = True
                 state[state_key] = previous
                 save_json(STATE_FILE, state)
+                logger.info(f"[{name}] Bootstrap completed: registered {bootstrapped_count} historical articles; watermark preserved at {iso_utc(last_dt)}")
 
             # Hard cutoff: NEVER post anything older than the saved watermark.
             # Equal timestamps are allowed only for new IDs/titles at that time.
