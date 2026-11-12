@@ -40,7 +40,6 @@ HELP_COOLDOWN_SECONDS = 5
 next_poll_times = {}  # key: (provider, url, chan_id) -> next poll datetime
 MAX_POSTS_PER_POLL = 10  # Maximum successful posts per feed poll
 ARTICLE_HISTORY_LIMIT = 500  # Maximum remembered articles PER Discord channel
-LATE_ARRIVAL_LOOKBACK_DAYS = 7  # Accept articles dated up to 7 days before last watermark
 
 # ── Ransomware.Live embed‐templates ──────────────────────────────────────────
 RANSOMWARE_TEMPLATES = {
@@ -348,6 +347,8 @@ async def fetch_and_post(feed):
             if not isinstance(items, list) or not items:
                 return
 
+            # Only consider articles whose timestamps are no later than this poll.
+            poll_now = datetime.now(pytz.UTC)
             parsed = []
             for item in items:
                 if not isinstance(item, dict):
@@ -367,8 +368,12 @@ async def fetch_and_post(feed):
                 pub_dt = next((dt for value in candidates
                                if isinstance(value, str) and (dt := parse_any_iso(value)).year >= 1999), None)
                 if pub_dt is None:
-                    logger.warning(f"[{name}] Article has no valid timestamp; using fetch time: {aliases[0]}")
-                    pub_dt = datetime.now(pytz.UTC)
+                    # Do not invent a current timestamp for an old/undated article.
+                    logger.warning(f"[{name}] Skipping article without valid timestamp: {aliases[0]}")
+                    continue
+                if pub_dt > poll_now:
+                    logger.warning(f"[{name}] Skipping future-dated article: {aliases[0]} at {iso_utc(pub_dt)}")
+                    continue
                 title = str(item.get('post_title') or item.get('title') or '(untitled)')
                 parsed.append((pub_dt, title, item, aliases))
 
@@ -410,10 +415,18 @@ async def fetch_and_post(feed):
                 state[state_key] = previous
                 save_json(STATE_FILE, state)
 
-            # Lookback allows items to arrive late with earlier publication dates.
-            cutoff = last_dt - timedelta(days=LATE_ARRIVAL_LOOKBACK_DAYS)
-            pending = [row for row in parsed
-                       if row[0] >= cutoff and not has_been_posted(channel_key, row[3])]
+            # Hard cutoff: NEVER post anything older than the saved watermark.
+            # Equal timestamps are allowed only for new IDs/titles at that time.
+            # The per-channel 500-article history provides a second duplicate check.
+            pending = [
+                row for row in parsed
+                if (
+                    row[0] > last_dt
+                    or (row[0] == last_dt
+                        and tie_key(row[2], row[1]) not in seen_at_watermark)
+                )
+                and not has_been_posted(channel_key, row[3])
+            ]
             if not pending:
                 return
 
@@ -427,9 +440,10 @@ async def fetch_and_post(feed):
                     embed = build_dynamic_embed(feed, item)
                     await channel.send(embed=embed)
                 except Exception:
-                    # One bad article must not block the other news in the batch.
-                    logger.exception(f"[{name}] Failed to post {title!r}; other articles will continue")
-                    continue
+                    # Do not advance the watermark past a failed article.
+                    # Retrying it on the next poll is safer than silently losing it.
+                    logger.exception(f"[{name}] Failed to post {title!r}; stopping this feed poll to retry")
+                    break
 
                 remember_post(channel_key, aliases)
                 if pub_dt > last_dt:
